@@ -8,6 +8,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Pick the right CPU code path per ABI: ARM gets the NEON/dotprod kernels, x86_64 (emulators) the generic one.
 if(ANDROID_ABI STREQUAL "arm64-v8a")
     set(GGML_SYSTEM_ARCH "ARM" CACHE STRING "" FORCE)
+    # Dot-product + fp16 instructions: present on virtually every arm64 phone since 2019 (Cortex-A55/A75 and newer)
+    # and several times faster for quantized matmuls than the generic armv8-a path.
+    set(GGML_CPU_ARM_ARCH "armv8.2-a+dotprod+fp16" CACHE STRING "" FORCE)
 elseif(ANDROID_ABI STREQUAL "x86_64")
     set(GGML_SYSTEM_ARCH "x86" CACHE STRING "" FORCE)
 endif()
