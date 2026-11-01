@@ -56,6 +56,7 @@ jobs:
           VERSION="${TAG#v}"
           awk -v v="$VERSION" '
             /^## \[/ { if (found) exit; if (index($0, "[" v "]")) { found = 1; next } }
+            /^\[[^]]+\]: / { if (found) exit }
             found { print }
           ' CHANGELOG.md > notes.md
           cat >> notes.md <<NOTES
