@@ -1,0 +1,101 @@
+name: Release
+
+# Push a tag like v0.1.0 (or run this workflow by hand with the tag name) to:
+#   1. run the unit tests and build the release AAR (arm64-v8a + x86_64),
+#   2. create the GitHub release with the matching CHANGELOG section as notes,
+#   3. attach the AAR, so the library can be used without JitPack,
+#   4. ask JitPack to build the same tag.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release, e.g. v0.1.0 (created on the selected branch if it does not exist)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Install NDK and CMake
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "ndk;28.2.13676358" "cmake;4.1.2" > /dev/null
+
+      - name: Unit tests
+        run: ./gradlew :llama:testDebugUnitTest
+
+      - name: Build the AAR
+        run: |
+          VERSION="${TAG#v}"
+          ./gradlew :llama:assembleRelease -PVERSION_NAME="$VERSION"
+          cp llama/build/outputs/aar/llama-release.aar "llama-kotlin-$VERSION.aar"
+          sha256sum "llama-kotlin-$VERSION.aar" > "llama-kotlin-$VERSION.aar.sha256"
+
+      - name: Release notes from CHANGELOG.md
+        run: |
+          VERSION="${TAG#v}"
+          awk -v v="$VERSION" '
+            /^## \[/ { if (found) exit; if (index($0, "[" v "]")) { found = 1; next } }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          cat >> notes.md <<NOTES
+
+          ## Install
+
+          \`\`\`kotlin
+          // settings.gradle.kts
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven("https://jitpack.io")
+              }
+          }
+
+          // app/build.gradle.kts
+          dependencies {
+              implementation("com.github.ThalzeronLabs:llama-kotlin:$TAG")
+          }
+          \`\`\`
+
+          No JitPack? Download \`llama-kotlin-$VERSION.aar\` below, put it in \`app/libs/\` and add
+          \`implementation(files("libs/llama-kotlin-$VERSION.aar"))\` plus
+          \`implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")\`.
+          NOTES
+          cat notes.md
+
+      - name: Create or update the GitHub release
+        run: |
+          VERSION="${TAG#v}"
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file notes.md --target "$GITHUB_SHA"
+          fi
+          gh release upload "$TAG" "llama-kotlin-$VERSION.aar" "llama-kotlin-$VERSION.aar.sha256" --clobber
+
+      - name: Ask JitPack to build the tag
+        continue-on-error: true
+        run: |
+          curl -sS --max-time 30 -o /dev/null -w "JitPack answered %{http_code}\n" \
+            "https://jitpack.io/com/github/ThalzeronLabs/llama-kotlin/$TAG/llama-kotlin-$TAG.pom" || true

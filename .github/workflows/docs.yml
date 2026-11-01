@@ -1,0 +1,50 @@
+name: API docs
+
+# Builds the Dokka HTML reference and publishes it to GitHub Pages (gh-pages branch).
+on:
+  push:
+    branches: [main]
+    paths:
+      - "llama/src/main/**"
+      - "llama/Module.md"
+      - "llama/build.gradle.kts"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: docs
+  cancel-in-progress: true
+
+jobs:
+  dokka:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Install NDK and CMake
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "ndk;28.2.13676358" "cmake;4.1.2" > /dev/null
+
+      - name: Generate the HTML reference
+        run: ./gradlew :llama:dokkaGenerate
+
+      - name: Publish to the gh-pages branch
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: llama/build/dokka/html
+          publish_branch: gh-pages
+          force_orphan: true
+          commit_message: "docs: API reference for ${{ github.sha }}"

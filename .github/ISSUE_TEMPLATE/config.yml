@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: API reference
+    url: https://thalzeronlabs.github.io/llama-kotlin/
+    about: Every public class and function, with examples.
+  - name: llama.cpp model support
+    url: https://github.com/ggml-org/llama.cpp#description
+    about: Whether a model architecture is supported is decided upstream in llama.cpp.

@@ -31,3 +31,6 @@ jobs:
 
       - name: Build the AAR (arm64-v8a + x86_64)
         run: ./gradlew :llama:assembleRelease
+
+      - name: Publishing and API docs still build
+        run: ./gradlew :llama:publishToMavenLocal :llama:dokkaGenerate -x test
