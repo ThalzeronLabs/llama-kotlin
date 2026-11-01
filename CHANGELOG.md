@@ -6,6 +6,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-01
+
+### Fixed
+
+- JitPack build. JitPack's image has an older glibc than the Android SDK's CMake 4.1.2 binary needs, so the
+  `v0.1.0` build failed before compiling any C++. `jitpack.yml` now uses the official Kitware CMake 4.1.2, which
+  runs there. Install with `com.github.ThalzeronLabs:llama-kotlin:v0.1.1`. The library code is unchanged from 0.1.0.
+- Release notes no longer include the CHANGELOG's link references.
+
 ## [0.1.0] - 2026-11-01
 
 First public release.
@@ -27,5 +36,6 @@ First public release.
 - Contributor guide, code of conduct, issue and pull request templates.
 - `kotlinx-coroutines-core` is exposed as an `api` dependency, because `Flow` is part of the public API.
 
-[Unreleased]: https://github.com/ThalzeronLabs/llama-kotlin/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/ThalzeronLabs/llama-kotlin/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/ThalzeronLabs/llama-kotlin/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ThalzeronLabs/llama-kotlin/releases/tag/v0.1.0
