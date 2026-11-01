@@ -26,7 +26,7 @@ dependencyResolutionManagement {
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.ThalzeronLabs:llama-kotlin:v0.1.0")
+    implementation("com.github.ThalzeronLabs:llama-kotlin:v0.1.1")
 }
 ```
 
@@ -54,7 +54,7 @@ Every [GitHub release](https://github.com/ThalzeronLabs/llama-kotlin/releases) h
 
 ```kotlin
 dependencies {
-    implementation(files("libs/llama-kotlin-0.1.0.aar"))
+    implementation(files("libs/llama-kotlin-0.1.1.aar"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2") // not pulled in by a plain AAR
 }
 ```

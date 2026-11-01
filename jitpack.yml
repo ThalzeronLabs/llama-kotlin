@@ -1,8 +1,11 @@
 # JitPack build: https://jitpack.io/#ThalzeronLabs/llama-kotlin
 #
 # The library compiles llama.cpp (C++) for arm64-v8a and x86_64, so the build needs the
-# Android NDK and CMake on top of the SDK. The script below installs exactly the versions
-# pinned in llama/build.gradle.kts, reusing the SDK that JitPack provides when there is one.
+# Android NDK and CMake on top of the SDK.
+#
+# JitPack's build image has an old glibc (< 2.25). The NDK toolchain runs there, but the
+# Android SDK's own CMake 4.1.2 binary needs glibc 2.28, so this build uses the official
+# Kitware CMake 4.1.2 (glibc 2.17+) with the SDK's ninja, wired in through cmake.dir.
 jdk:
   - openjdk17
 
@@ -21,7 +24,16 @@ before_install:
     fi
     yes | "$SDKMANAGER" --licenses > /dev/null || true
     "$SDKMANAGER" "platforms;android-37.0" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;4.1.2" > /dev/null
-    echo "sdk.dir=$SDK" > local.properties
+
+    CMAKE_HOME="$HOME/cmake-4.1.2"
+    curl -sSL https://github.com/Kitware/CMake/releases/download/v4.1.2/cmake-4.1.2-linux-x86_64.tar.gz | tar xz -C "$HOME"
+    rm -rf "$CMAKE_HOME"
+    mv "$HOME/cmake-4.1.2-linux-x86_64" "$CMAKE_HOME"
+    cp "$SDK/cmake/4.1.2/bin/ninja" "$CMAKE_HOME/bin/ninja"
+    "$CMAKE_HOME/bin/cmake" --version
+    "$CMAKE_HOME/bin/ninja" --version
+
+    printf 'sdk.dir=%s\ncmake.dir=%s\n' "$SDK" "$CMAKE_HOME" > local.properties
 
 install:
   - ./gradlew :llama:publishToMavenLocal -x test --no-daemon --stacktrace
