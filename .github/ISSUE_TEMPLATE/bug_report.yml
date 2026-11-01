@@ -1,0 +1,44 @@
+name: Bug report
+description: Something does not work as documented
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for reporting! The more of the fields below you fill in, the faster this gets fixed.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: code
+    attributes:
+      label: Minimal code
+      description: The smallest Kotlin snippet that shows the problem.
+      render: kotlin
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logcat / stack trace
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: llama-kotlin version
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Device, Android version and ABI
+      placeholder: Pixel 7, Android 15, arm64-v8a
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model file and quantization
+      placeholder: qwen2.5-0.5b-instruct-q4_k_m.gguf
