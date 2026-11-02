@@ -3,7 +3,7 @@ name: Release
 # Push a tag like v0.1.0 (or run this workflow by hand with the tag name) to:
 #   1. run the unit tests and build the release AAR (arm64-v8a + x86_64),
 #   2. create the GitHub release with the matching CHANGELOG section as notes,
-#   3. attach the AAR, so the library can be used without JitPack,
+#   3. attach the AAR, so the library can be used without JitPack, and the benchmark APK,
 #   4. ask JitPack to build the same tag.
 on:
   push:
@@ -42,14 +42,15 @@ jobs:
             "ndk;28.2.13676358" "cmake;4.1.2" > /dev/null
 
       - name: Unit tests
-        run: ./gradlew :llama:testDebugUnitTest
+        run: ./gradlew :llama:testDebugUnitTest :benchmark:testDebugUnitTest
 
       - name: Build the AAR
         run: |
           VERSION="${TAG#v}"
-          ./gradlew :llama:assembleRelease -PVERSION_NAME="$VERSION"
+          ./gradlew :llama:assembleRelease :benchmark:assembleRelease -PVERSION_NAME="$VERSION"
           cp llama/build/outputs/aar/llama-release.aar "llama-kotlin-$VERSION.aar"
           sha256sum "llama-kotlin-$VERSION.aar" > "llama-kotlin-$VERSION.aar.sha256"
+          cp benchmark/build/outputs/apk/release/benchmark-release.apk "llama-kotlin-benchmark-$VERSION.apk"
 
       - name: Release notes from CHANGELOG.md
         run: |
@@ -82,6 +83,9 @@ jobs:
           No JitPack? Download \`llama-kotlin-$VERSION.aar\` below, put it in \`app/libs/\` and add
           \`implementation(files("libs/llama-kotlin-$VERSION.aar"))\` plus
           \`implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")\`.
+
+          Want numbers for your own phone? \`llama-kotlin-benchmark-$VERSION.apk\` measures prompt and generation
+          speed on the device: see [benchmark/README.md](https://github.com/ThalzeronLabs/llama-kotlin/blob/$TAG/benchmark/README.md).
           NOTES
           cat notes.md
 
@@ -93,7 +97,8 @@ jobs:
           else
             gh release create "$TAG" --title "$TAG" --notes-file notes.md --target "$GITHUB_SHA"
           fi
-          gh release upload "$TAG" "llama-kotlin-$VERSION.aar" "llama-kotlin-$VERSION.aar.sha256" --clobber
+          gh release upload "$TAG" "llama-kotlin-$VERSION.aar" "llama-kotlin-$VERSION.aar.sha256" \
+            "llama-kotlin-benchmark-$VERSION.apk" --clobber
 
       - name: Ask JitPack to build the tag
         continue-on-error: true

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- No activity: the benchmark is started from a computer with `adb shell am instrument` (see README.md). -->
+    <application
+        android:allowBackup="false"
+        android:label="llama-kotlin benchmark" />
+
+    <instrumentation
+        android:name=".BenchmarkInstrumentation"
+        android:label="llama-kotlin benchmark"
+        android:targetPackage="com.thalzeronlabs.llama.benchmark" />
+</manifest>

@@ -17,3 +17,4 @@ dependencyResolutionManagement {
 rootProject.name = "llama-kotlin"
 
 include(":llama")
+include(":benchmark")

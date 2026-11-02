@@ -15,6 +15,8 @@ internal object NativeBridge {
 
     @JvmStatic external fun loadModel(path: String, useMmap: Boolean): Long
     @JvmStatic external fun freeModel(model: Long)
+    @JvmStatic external fun tokenCount(model: Long, text: String, addSpecial: Boolean): Int
+    @JvmStatic external fun embeddingSize(model: Long): Int
     @JvmStatic external fun applyChatTemplate(
         model: Long,
         roles: Array<String>,
@@ -35,9 +37,17 @@ internal object NativeBridge {
     ): Long
 
     @JvmStatic external fun freeSession(session: Long)
+    @JvmStatic external fun beginGeneration(session: Long, grammar: String?, grammarRoot: String?)
     @JvmStatic external fun ingest(session: Long, text: String, addSpecial: Boolean): Int
+    @JvmStatic external fun ingestReusingPrefix(session: Long, text: String, addSpecial: Boolean): IntArray
     @JvmStatic external fun nextToken(session: Long): ByteArray?
     @JvmStatic external fun reset(session: Long)
     @JvmStatic external fun usedTokens(session: Long): Int
     @JvmStatic external fun contextSize(session: Long): Int
+    @JvmStatic external fun saveState(session: Long, path: String)
+    @JvmStatic external fun loadState(session: Long, path: String): Int
+
+    @JvmStatic external fun newEmbedder(model: Long, nCtx: Int, nThreads: Int): Long
+    @JvmStatic external fun freeEmbedder(embedder: Long)
+    @JvmStatic external fun embed(embedder: Long, text: String): FloatArray
 }

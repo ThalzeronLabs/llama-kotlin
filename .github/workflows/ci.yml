@@ -27,10 +27,48 @@ jobs:
             "ndk;28.2.13676358" "cmake;4.1.2" > /dev/null
 
       - name: Unit tests
-        run: ./gradlew :llama:testDebugUnitTest
+        run: ./gradlew :llama:testDebugUnitTest :benchmark:testDebugUnitTest
 
-      - name: Build the AAR (arm64-v8a + x86_64)
-        run: ./gradlew :llama:assembleRelease
+      - name: Build the AAR (arm64-v8a + x86_64) and the benchmark APK
+        run: ./gradlew :llama:assembleRelease :benchmark:assembleRelease
 
       - name: Publishing and API docs still build
         run: ./gradlew :llama:publishToMavenLocal :llama:dokkaGenerate -x test
+
+      - name: Upload the benchmark APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-kotlin-benchmark-apk
+          path: benchmark/build/outputs/apk/release/benchmark-release.apk
+          retention-days: 14
+
+  # The same JNI code, compiled for Linux, run against two tiny real models: checks what the fake engine cannot
+  # (grammars, embeddings, saved state, the prefix cache) on every push. Speeds from here are never reported.
+  host-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Install NDK and CMake
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "ndk;28.2.13676358" "cmake;4.1.2" > /dev/null
+
+      - name: Cache the test models
+        uses: actions/cache@v4
+        with:
+          path: build-host/models
+          key: host-test-models-v1
+
+      - name: Build for the host and run every test against real llama.cpp
+        run: scripts/host-test.sh

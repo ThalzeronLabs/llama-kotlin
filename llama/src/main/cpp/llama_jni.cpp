@@ -1,13 +1,17 @@
 // JNI bridge between Kotlin and llama.cpp.
 //
-// Ownership model: Kotlin holds opaque `long` handles (a llama_model* or a Session*) and is responsible for
-// calling the matching free function exactly once. A Session is never used from two threads at the same time:
-// the Kotlin side confines each session to its own single-thread dispatcher.
+// Ownership model: Kotlin holds opaque `long` handles (a llama_model*, a Session* or an Embedder*) and is
+// responsible for calling the matching free function exactly once. A Session or an Embedder is never used from
+// two threads at the same time: the Kotlin side confines each one (a dispatcher thread or a mutex).
+//
+// The file also builds on a desktop JVM (Linux/macOS) so the host integration tests can run it against a real
+// model; only logging differs.
 
 #include <jni.h>
-#include <android/log.h>
 
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -16,18 +20,43 @@
 #include "llama.h"
 
 #define LOG_TAG "llama-kotlin"
+#ifdef __ANDROID__
+#include <android/log.h>
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#else
+#define LOGI(...) do { std::fprintf(stderr, LOG_TAG ": " __VA_ARGS__); std::fputc('\n', stderr); } while (0)
+#endif
 
 namespace {
 
+// Sampling settings of a session. The sampler chain is rebuilt from them before every generation, so each
+// generation starts from the same random state: same seed + same context + same prompt = same answer.
+struct SamplingConfig {
+    float    temperature      = 0.7f;
+    int32_t  top_k            = 40;
+    float    top_p            = 0.95f;
+    float    min_p            = 0.05f;
+    uint32_t seed             = 42;
+};
+
 struct Session {
-    llama_context *     ctx   = nullptr;
-    llama_sampler *     smpl  = nullptr;
-    llama_batch_ext *   batch = nullptr;
-    const llama_vocab * vocab = nullptr;
-    int32_t             n_pos   = 0;
+    llama_context *     ctx     = nullptr;
+    llama_sampler *     chain   = nullptr; // everything but the grammar
+    llama_sampler *     grammar = nullptr; // optional, applied lazily (see sample())
+    llama_batch_ext *   batch   = nullptr;
+    const llama_vocab * vocab   = nullptr;
     int32_t             n_batch = 0;
+    SamplingConfig      sampling;
+    // Every token currently held in the KV cache, in order. Its size is the next position.
+    std::vector<llama_token> history;
+    std::vector<llama_token_data> candidates;
+};
+
+struct Embedder {
+    llama_context *     ctx    = nullptr;
+    llama_batch_ext *   batch  = nullptr;
+    const llama_vocab * vocab  = nullptr;
+    int32_t             n_embd = 0;
 };
 
 std::once_flag g_backend_once;
@@ -43,11 +72,27 @@ void throw_state(JNIEnv * env, const std::string & msg) {
     throw_java(env, "java/lang/IllegalStateException", msg);
 }
 
+void throw_context_full(JNIEnv * env, size_t needed, int32_t left) {
+    throw_java(env, "com/thalzeronlabs/llama/ContextFullException",
+               "Prompt needs " + std::to_string(needed) + " tokens but only " + std::to_string(std::max(left, 0)) +
+               " are left in the context window.");
+}
+
+// Reads a Java String as real UTF-8. GetStringUTFChars returns *modified* UTF-8, which encodes emoji as two
+// 3-byte surrogates that the tokenizer would not recognize, so the bytes come from String.getBytes("UTF-8").
 std::string to_std_string(JNIEnv * env, jstring s) {
     if (s == nullptr) return {};
-    const char * chars = env->GetStringUTFChars(s, nullptr);
-    std::string out(chars);
-    env->ReleaseStringUTFChars(s, chars);
+    jclass string_class = env->GetObjectClass(s);
+    jmethodID get_bytes = env->GetMethodID(string_class, "getBytes", "(Ljava/lang/String;)[B");
+    jstring charset = env->NewStringUTF("UTF-8");
+    auto bytes = static_cast<jbyteArray>(env->CallObjectMethod(s, get_bytes, charset));
+    env->DeleteLocalRef(charset);
+    env->DeleteLocalRef(string_class);
+    if (bytes == nullptr) return {};
+    const jsize n = env->GetArrayLength(bytes);
+    std::string out(static_cast<size_t>(n), '\0');
+    env->GetByteArrayRegion(bytes, 0, n, reinterpret_cast<jbyte *>(out.data()));
+    env->DeleteLocalRef(bytes);
     return out;
 }
 
@@ -67,27 +112,10 @@ jstring utf8_to_jstring(JNIEnv * env, const std::string & text) {
     return result;
 }
 
-// Feeds `tokens` to the model in chunks of at most n_batch, asking for logits only on the very last one.
-bool process_tokens(Session * s, const llama_token * tokens, int32_t count) {
-    int32_t done = 0;
-    while (done < count) {
-        const int32_t chunk = std::min(s->n_batch, count - done);
-        llama_batch_ext_clear(s->batch);
-        for (int32_t i = 0; i < chunk; ++i) {
-            const int32_t idx = llama_batch_ext_add_token(s->batch, 0, tokens[done + i]);
-            if (idx < 0) return false;
-            const llama_pos pos = s->n_pos + i;
-            llama_batch_ext_set_pos(s->batch, idx, &pos);
-        }
-        const bool last_chunk = done + chunk == count;
-        if (last_chunk) {
-            llama_batch_ext_set_output_logits(s->batch, chunk - 1, true);
-        }
-        if (llama_process(s->ctx, LLAMA_PROCESS_TYPE_DECODE, s->batch) != 0) return false;
-        s->n_pos += chunk;
-        done += chunk;
-    }
-    return true;
+int resolve_threads(jint n_threads) {
+    return n_threads > 0
+            ? n_threads
+            : std::max(1, std::min(4, static_cast<int>(std::thread::hardware_concurrency()) - 2));
 }
 
 std::vector<llama_token> tokenize(const llama_vocab * vocab, const std::string & text, bool add_special) {
@@ -99,6 +127,106 @@ std::vector<llama_token> tokenize(const llama_vocab * vocab, const std::string &
                        tokens.data(), needed, add_special, true);
     }
     return tokens;
+}
+
+// Feeds `tokens` to the model in chunks of at most n_batch, asking for logits only on the very last one.
+bool process_tokens(Session * s, const llama_token * tokens, int32_t count) {
+    int32_t done = 0;
+    while (done < count) {
+        const int32_t chunk = std::min(s->n_batch, count - done);
+        llama_batch_ext_clear(s->batch);
+        const auto base = static_cast<llama_pos>(s->history.size());
+        for (int32_t i = 0; i < chunk; ++i) {
+            const int32_t idx = llama_batch_ext_add_token(s->batch, 0, tokens[done + i]);
+            if (idx < 0) return false;
+            const llama_pos pos = base + i;
+            llama_batch_ext_set_pos(s->batch, idx, &pos);
+        }
+        const bool last_chunk = done + chunk == count;
+        if (last_chunk) {
+            llama_batch_ext_set_output_logits(s->batch, chunk - 1, true);
+        }
+        if (llama_process(s->ctx, LLAMA_PROCESS_TYPE_DECODE, s->batch) != 0) return false;
+        s->history.insert(s->history.end(), tokens + done, tokens + done + chunk);
+        done += chunk;
+    }
+    return true;
+}
+
+// Drops every token from position `keep` on, from both the KV cache and the history.
+// Returns false when the memory cannot be cut there (recurrent models only support a full clear).
+bool truncate_history(Session * s, size_t keep) {
+    if (keep >= s->history.size()) return true;
+    llama_memory_t mem = llama_get_memory(s->ctx);
+    if (!llama_memory_seq_rm(mem, 0, static_cast<llama_pos>(keep), -1)) return false;
+    s->history.resize(keep);
+    return true;
+}
+
+void clear_history(Session * s) {
+    llama_memory_clear(llama_get_memory(s->ctx), true);
+    s->history.clear();
+}
+
+void free_samplers(Session * s) {
+    if (s->chain != nullptr) llama_sampler_free(s->chain);
+    if (s->grammar != nullptr) llama_sampler_free(s->grammar);
+    s->chain = nullptr;
+    s->grammar = nullptr;
+}
+
+// The sampler chain of one generation. A repetition penalty (issue #2) would go right after top-k.
+llama_sampler * build_chain(const SamplingConfig & c) {
+    llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    if (c.temperature <= 0.0f) {
+        llama_sampler_chain_add(chain, llama_sampler_init_greedy());
+    } else {
+        if (c.top_k > 0) llama_sampler_chain_add(chain, llama_sampler_init_top_k(c.top_k));
+        if (c.top_p < 1.0f) llama_sampler_chain_add(chain, llama_sampler_init_top_p(c.top_p, 1));
+        if (c.min_p > 0.0f) llama_sampler_chain_add(chain, llama_sampler_init_min_p(c.min_p, 1));
+        llama_sampler_chain_add(chain, llama_sampler_init_temp(c.temperature));
+        llama_sampler_chain_add(chain, llama_sampler_init_dist(c.seed));
+    }
+    return chain;
+}
+
+void fill_candidates(Session * s, const float * logits) {
+    const int32_t n_vocab = llama_vocab_n_tokens(s->vocab);
+    s->candidates.resize(n_vocab);
+    for (int32_t id = 0; id < n_vocab; ++id) {
+        s->candidates[id] = llama_token_data{ id, logits[id], 0.0f };
+    }
+}
+
+// Picks the next token. With a grammar, the same trick as llama.cpp's own common sampler: sample without the
+// grammar first and only check that one token against it, which is far cheaper than running the grammar over the
+// whole vocabulary. If the grammar rejects it, sample again with the grammar applied first.
+llama_token sample(Session * s) {
+    const float * logits = llama_get_logits_ith(s->ctx, -1);
+    if (logits == nullptr) return LLAMA_TOKEN_NULL;
+
+    fill_candidates(s, logits);
+    llama_token_data_array cur = { s->candidates.data(), s->candidates.size(), -1, false };
+    llama_sampler_apply(s->chain, &cur);
+    if (cur.selected < 0) return LLAMA_TOKEN_NULL;
+    llama_token token = cur.data[cur.selected].id;
+
+    if (s->grammar != nullptr) {
+        llama_token_data single = { token, 1.0f, 0.0f };
+        llama_token_data_array single_arr = { &single, 1, -1, false };
+        llama_sampler_apply(s->grammar, &single_arr);
+        if (std::isinf(single.logit) && single.logit < 0) {
+            fill_candidates(s, logits);
+            cur = { s->candidates.data(), s->candidates.size(), -1, false };
+            llama_sampler_apply(s->grammar, &cur);
+            llama_sampler_apply(s->chain, &cur);
+            if (cur.selected < 0) return LLAMA_TOKEN_NULL;
+            token = cur.data[cur.selected].id;
+        }
+        llama_sampler_accept(s->grammar, token);
+    }
+    llama_sampler_accept(s->chain, token);
+    return token;
 }
 
 } // namespace
@@ -129,6 +257,20 @@ Java_com_thalzeronlabs_llama_NativeBridge_loadModel(JNIEnv * env, jclass, jstrin
 JNIEXPORT void JNICALL
 Java_com_thalzeronlabs_llama_NativeBridge_freeModel(JNIEnv *, jclass, jlong handle) {
     llama_model_free(reinterpret_cast<llama_model *>(handle));
+}
+
+JNIEXPORT jint JNICALL
+Java_com_thalzeronlabs_llama_NativeBridge_tokenCount(JNIEnv * env, jclass, jlong model_handle, jstring jtext,
+                                                     jboolean add_special) {
+    auto * model = reinterpret_cast<llama_model *>(model_handle);
+    const std::string text = to_std_string(env, jtext);
+    return -llama_tokenize(llama_model_get_vocab(model), text.c_str(), static_cast<int32_t>(text.size()),
+                           nullptr, 0, add_special == JNI_TRUE, /* parse_special */ true);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_thalzeronlabs_llama_NativeBridge_embeddingSize(JNIEnv *, jclass, jlong model_handle) {
+    return llama_model_n_embd_out(reinterpret_cast<llama_model *>(model_handle));
 }
 
 JNIEXPORT jstring JNICALL
@@ -171,6 +313,10 @@ Java_com_thalzeronlabs_llama_NativeBridge_applyChatTemplate(
     return utf8_to_jstring(env, std::string(buf.data(), len));
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Sessions (text generation)
+// ---------------------------------------------------------------------------------------------------------------
+
 JNIEXPORT jlong JNICALL
 Java_com_thalzeronlabs_llama_NativeBridge_newSession(
         JNIEnv * env, jclass, jlong model_handle,
@@ -182,9 +328,7 @@ Java_com_thalzeronlabs_llama_NativeBridge_newSession(
     cparams.n_ctx = static_cast<uint32_t>(n_ctx);
     cparams.n_batch = static_cast<uint32_t>(n_batch);
     cparams.n_ubatch = static_cast<uint32_t>(n_batch);
-    const int threads = n_threads > 0
-            ? n_threads
-            : std::max(1, std::min(4, static_cast<int>(std::thread::hardware_concurrency()) - 2));
+    const int threads = resolve_threads(n_threads);
     cparams.n_threads = threads;
     cparams.n_threads_batch = threads;
 
@@ -194,23 +338,17 @@ Java_com_thalzeronlabs_llama_NativeBridge_newSession(
         return 0;
     }
 
-    llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    if (temperature <= 0.0f) {
-        llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
-    } else {
-        if (top_k > 0) llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k));
-        if (top_p < 1.0f) llama_sampler_chain_add(smpl, llama_sampler_init_top_p(top_p, 1));
-        if (min_p > 0.0f) llama_sampler_chain_add(smpl, llama_sampler_init_min_p(min_p, 1));
-        llama_sampler_chain_add(smpl, llama_sampler_init_temp(temperature));
-        llama_sampler_chain_add(smpl, llama_sampler_init_dist(static_cast<uint32_t>(seed)));
-    }
-
     auto * s = new Session();
     s->ctx = ctx;
-    s->smpl = smpl;
     s->batch = llama_batch_ext_init(ctx);
     s->vocab = llama_model_get_vocab(model);
     s->n_batch = n_batch;
+    s->sampling.temperature = temperature;
+    s->sampling.top_k = top_k;
+    s->sampling.top_p = top_p;
+    s->sampling.min_p = min_p;
+    s->sampling.seed = static_cast<uint32_t>(seed);
+    s->chain = build_chain(s->sampling);
     LOGI("session ready: n_ctx=%d n_batch=%d threads=%d", n_ctx, n_batch, threads);
     return reinterpret_cast<jlong>(s);
 }
@@ -219,12 +357,32 @@ JNIEXPORT void JNICALL
 Java_com_thalzeronlabs_llama_NativeBridge_freeSession(JNIEnv *, jclass, jlong handle) {
     auto * s = reinterpret_cast<Session *>(handle);
     if (s == nullptr) return;
+    free_samplers(s);
     llama_batch_ext_free(s->batch);
-    llama_sampler_free(s->smpl);
     llama_free(s->ctx);
     delete s;
 }
 
+// Rebuilds the sampler chain (fresh random state from the seed) and installs the grammar,
+// if any. Throws IllegalArgumentException when the grammar does not parse.
+JNIEXPORT void JNICALL
+Java_com_thalzeronlabs_llama_NativeBridge_beginGeneration(
+        JNIEnv * env, jclass, jlong handle, jstring jgrammar, jstring jroot) {
+    auto * s = reinterpret_cast<Session *>(handle);
+    free_samplers(s);
+    s->chain = build_chain(s->sampling);
+    if (jgrammar != nullptr) {
+        const std::string grammar = to_std_string(env, jgrammar);
+        const std::string root = to_std_string(env, jroot);
+        s->grammar = llama_sampler_init_grammar(s->vocab, grammar.c_str(), root.c_str());
+        if (s->grammar == nullptr) {
+            throw_java(env, "java/lang/IllegalArgumentException",
+                       "llama.cpp could not parse the GBNF grammar (root rule \"" + root + "\").");
+        }
+    }
+}
+
+// Appends `text` to what the session holds. Returns the number of tokens processed.
 JNIEXPORT jint JNICALL
 Java_com_thalzeronlabs_llama_NativeBridge_ingest(
         JNIEnv * env, jclass, jlong handle, jstring jtext, jboolean add_special) {
@@ -233,10 +391,9 @@ Java_com_thalzeronlabs_llama_NativeBridge_ingest(
     if (tokens.empty()) return 0;
 
     const auto n_ctx = static_cast<int32_t>(llama_n_ctx(s->ctx));
-    if (s->n_pos + static_cast<int32_t>(tokens.size()) >= n_ctx) {
-        throw_java(env, "com/thalzeronlabs/llama/ContextFullException",
-                   "Prompt needs " + std::to_string(tokens.size()) + " tokens but only " +
-                   std::to_string(n_ctx - s->n_pos) + " are left in the context window.");
+    const auto used = static_cast<int32_t>(s->history.size());
+    if (used + static_cast<int32_t>(tokens.size()) >= n_ctx) {
+        throw_context_full(env, tokens.size(), n_ctx - used);
         return 0;
     }
     if (!process_tokens(s, tokens.data(), static_cast<int32_t>(tokens.size()))) {
@@ -246,15 +403,51 @@ Java_com_thalzeronlabs_llama_NativeBridge_ingest(
     return static_cast<jint>(tokens.size());
 }
 
+// Makes the session hold exactly `text`, reusing the longest prefix already in the KV cache, so a chat that
+// re-sends the whole conversation only pays for the new turn. Returns [prompt tokens, tokens reused].
+JNIEXPORT jintArray JNICALL
+Java_com_thalzeronlabs_llama_NativeBridge_ingestReusingPrefix(
+        JNIEnv * env, jclass, jlong handle, jstring jtext, jboolean add_special) {
+    auto * s = reinterpret_cast<Session *>(handle);
+    const auto tokens = tokenize(s->vocab, to_std_string(env, jtext), add_special == JNI_TRUE);
+
+    const auto n_ctx = static_cast<int32_t>(llama_n_ctx(s->ctx));
+    if (static_cast<int32_t>(tokens.size()) >= n_ctx) {
+        throw_context_full(env, tokens.size(), n_ctx);
+        return nullptr;
+    }
+
+    size_t common = 0;
+    while (common < tokens.size() && common < s->history.size() && tokens[common] == s->history[common]) {
+        ++common;
+    }
+    // At least the last prompt token is processed again, so its logits are fresh for sampling.
+    if (!tokens.empty() && common == tokens.size()) --common;
+    if (!truncate_history(s, common)) {
+        clear_history(s);
+        common = 0;
+    }
+    const auto rest = static_cast<int32_t>(tokens.size() - common);
+    if (rest > 0 && !process_tokens(s, tokens.data() + common, rest)) {
+        throw_state(env, "llama.cpp failed while processing the prompt.");
+        return nullptr;
+    }
+
+    jint out[2] = { static_cast<jint>(tokens.size()), static_cast<jint>(common) };
+    jintArray result = env->NewIntArray(2);
+    env->SetIntArrayRegion(result, 0, 2, out);
+    return result;
+}
+
 // Samples one token, feeds it back to the model and returns its raw UTF-8 bytes.
 // Returns null when the model emits an end-of-generation token or the context window is full.
 JNIEXPORT jbyteArray JNICALL
 Java_com_thalzeronlabs_llama_NativeBridge_nextToken(JNIEnv * env, jclass, jlong handle) {
     auto * s = reinterpret_cast<Session *>(handle);
-    if (s->n_pos + 1 >= static_cast<int32_t>(llama_n_ctx(s->ctx))) return nullptr;
+    if (static_cast<int32_t>(s->history.size()) + 1 >= static_cast<int32_t>(llama_n_ctx(s->ctx))) return nullptr;
 
-    const llama_token token = llama_sampler_sample(s->smpl, s->ctx, -1);
-    if (llama_vocab_is_eog(s->vocab, token)) return nullptr;
+    const llama_token token = sample(s);
+    if (token == LLAMA_TOKEN_NULL || llama_vocab_is_eog(s->vocab, token)) return nullptr;
 
     char piece[256];
     const int32_t n = llama_token_to_piece(s->vocab, token, piece, sizeof(piece), 0, /* special */ false);
@@ -275,19 +468,163 @@ Java_com_thalzeronlabs_llama_NativeBridge_nextToken(JNIEnv * env, jclass, jlong 
 JNIEXPORT void JNICALL
 Java_com_thalzeronlabs_llama_NativeBridge_reset(JNIEnv *, jclass, jlong handle) {
     auto * s = reinterpret_cast<Session *>(handle);
-    llama_memory_clear(llama_get_memory(s->ctx), true);
-    llama_sampler_reset(s->smpl);
-    s->n_pos = 0;
+    clear_history(s);
+    llama_sampler_reset(s->chain);
+    if (s->grammar != nullptr) llama_sampler_reset(s->grammar);
 }
 
 JNIEXPORT jint JNICALL
 Java_com_thalzeronlabs_llama_NativeBridge_usedTokens(JNIEnv *, jclass, jlong handle) {
-    return reinterpret_cast<Session *>(handle)->n_pos;
+    return static_cast<jint>(reinterpret_cast<Session *>(handle)->history.size());
 }
 
 JNIEXPORT jint JNICALL
 Java_com_thalzeronlabs_llama_NativeBridge_contextSize(JNIEnv *, jclass, jlong handle) {
     return static_cast<jint>(llama_n_ctx(reinterpret_cast<Session *>(handle)->ctx));
+}
+
+// Writes the KV cache and the token history to `path` (llama.cpp's session file format).
+JNIEXPORT void JNICALL
+Java_com_thalzeronlabs_llama_NativeBridge_saveState(JNIEnv * env, jclass, jlong handle, jstring jpath) {
+    auto * s = reinterpret_cast<Session *>(handle);
+    const std::string path = to_std_string(env, jpath);
+    if (!llama_state_save_file(s->ctx, path.c_str(), s->history.data(), s->history.size())) {
+        throw_java(env, "java/io/IOException", "Could not write the session state to " + path);
+    }
+}
+
+// Restores a file written by saveState into this session. Returns the number of tokens restored.
+JNIEXPORT jint JNICALL
+Java_com_thalzeronlabs_llama_NativeBridge_loadState(JNIEnv * env, jclass, jlong handle, jstring jpath) {
+    auto * s = reinterpret_cast<Session *>(handle);
+    const std::string path = to_std_string(env, jpath);
+    std::vector<llama_token> tokens(llama_n_ctx(s->ctx));
+    size_t count = 0;
+    if (!llama_state_load_file(s->ctx, path.c_str(), tokens.data(), tokens.size(), &count)) {
+        clear_history(s);
+        throw_java(env, "java/io/IOException",
+                   "Could not restore the session state from " + path +
+                   " (written by another model or llama.cpp version, or for a bigger context window?)");
+        return 0;
+    }
+    tokens.resize(count);
+    s->history = std::move(tokens);
+
+    // Recompute the logits of the last token so that generating right away (with an empty prompt) works.
+    if (!s->history.empty()) {
+        const llama_token last = s->history.back();
+        if (truncate_history(s, s->history.size() - 1)) {
+            if (!process_tokens(s, &last, 1)) {
+                clear_history(s);
+                throw_state(env, "llama.cpp failed while restoring the session state.");
+                return 0;
+            }
+        }
+    }
+    llama_sampler_reset(s->chain);
+    return static_cast<jint>(s->history.size());
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Embeddings
+// ---------------------------------------------------------------------------------------------------------------
+
+JNIEXPORT jlong JNICALL
+Java_com_thalzeronlabs_llama_NativeBridge_newEmbedder(
+        JNIEnv * env, jclass, jlong model_handle, jint n_ctx, jint n_threads) {
+    auto * model = reinterpret_cast<llama_model *>(model_handle);
+    if (llama_model_has_encoder(model) && llama_model_has_decoder(model)) {
+        throw_state(env, "Embeddings are not supported for encoder-decoder models.");
+        return 0;
+    }
+
+    const auto n_ctx_train = llama_model_n_ctx_train(model);
+    const auto ctx_size = static_cast<uint32_t>(n_ctx_train > 0 ? std::min<int32_t>(n_ctx, n_ctx_train) : n_ctx);
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx = ctx_size;
+    // The whole text goes through in one batch: pooling (mean, CLS, last) needs every token at once.
+    cparams.n_batch = ctx_size;
+    cparams.n_ubatch = ctx_size;
+    cparams.embeddings = true;
+    cparams.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED; // what the GGUF says
+    const int threads = resolve_threads(n_threads);
+    cparams.n_threads = threads;
+    cparams.n_threads_batch = threads;
+
+    llama_context * ctx = llama_init_from_model(model, cparams);
+    if (ctx != nullptr && llama_pooling_type(ctx) == LLAMA_POOLING_TYPE_NONE) {
+        // A model without a pooling type (a plain chat model): average the token vectors.
+        llama_free(ctx);
+        cparams.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+        ctx = llama_init_from_model(model, cparams);
+    }
+    if (ctx == nullptr) {
+        throw_state(env, "Could not create an embedding context (out of memory?).");
+        return 0;
+    }
+    if (llama_pooling_type(ctx) == LLAMA_POOLING_TYPE_RANK) {
+        llama_free(ctx);
+        throw_state(env, "This is a reranking model; it scores text pairs instead of producing embeddings.");
+        return 0;
+    }
+
+    auto * e = new Embedder();
+    e->ctx = ctx;
+    e->batch = llama_batch_ext_init(ctx);
+    e->vocab = llama_model_get_vocab(model);
+    e->n_embd = llama_model_n_embd_out(model);
+    LOGI("embedder ready: n_ctx=%u n_embd=%d pooling=%d", ctx_size, e->n_embd, llama_pooling_type(ctx));
+    return reinterpret_cast<jlong>(e);
+}
+
+JNIEXPORT void JNICALL
+Java_com_thalzeronlabs_llama_NativeBridge_freeEmbedder(JNIEnv *, jclass, jlong handle) {
+    auto * e = reinterpret_cast<Embedder *>(handle);
+    if (e == nullptr) return;
+    llama_batch_ext_free(e->batch);
+    llama_free(e->ctx);
+    delete e;
+}
+
+// Returns the pooled (not normalized) embedding of `text`.
+JNIEXPORT jfloatArray JNICALL
+Java_com_thalzeronlabs_llama_NativeBridge_embed(JNIEnv * env, jclass, jlong handle, jstring jtext) {
+    auto * e = reinterpret_cast<Embedder *>(handle);
+    const auto tokens = tokenize(e->vocab, to_std_string(env, jtext), /* add_special */ true);
+    if (tokens.empty()) {
+        throw_java(env, "java/lang/IllegalArgumentException", "Nothing to embed: the text has no tokens.");
+        return nullptr;
+    }
+    const auto n_ctx = static_cast<int32_t>(llama_n_ctx(e->ctx));
+    if (static_cast<int32_t>(tokens.size()) > n_ctx) {
+        throw_context_full(env, tokens.size(), n_ctx);
+        return nullptr;
+    }
+
+    llama_memory_clear(llama_get_memory(e->ctx), true);
+    llama_batch_ext_clear(e->batch);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        const int32_t idx = llama_batch_ext_add_token(e->batch, 0, tokens[i]);
+        if (idx < 0) {
+            throw_state(env, "The embedding batch is full.");
+            return nullptr;
+        }
+        const auto pos = static_cast<llama_pos>(i);
+        llama_batch_ext_set_pos(e->batch, idx, &pos);
+        llama_batch_ext_set_output_embd(e->batch, idx, true);
+    }
+    if (llama_process(e->ctx, LLAMA_PROCESS_TYPE_DECODE, e->batch) < 0) {
+        throw_state(env, "llama.cpp failed while computing the embedding.");
+        return nullptr;
+    }
+    const float * embd = llama_get_embeddings_seq(e->ctx, 0);
+    if (embd == nullptr) {
+        throw_state(env, "This model did not return a sequence embedding.");
+        return nullptr;
+    }
+    jfloatArray result = env->NewFloatArray(e->n_embd);
+    env->SetFloatArrayRegion(result, 0, e->n_embd, embd);
+    return result;
 }
 
 } // extern "C"

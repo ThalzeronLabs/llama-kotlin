@@ -7,6 +7,14 @@ Start with [com.thalzeronlabs.llama.LlamaModel.Companion.load], open a [com.thal
 [com.thalzeronlabs.llama.LlamaModel.newSession] and collect the `Flow<String>` returned by
 [com.thalzeronlabs.llama.LlamaSession.chat] or [com.thalzeronlabs.llama.LlamaSession.generate].
 
+- Structured output: pass a [com.thalzeronlabs.llama.Grammar] (GBNF, or
+  [com.thalzeronlabs.llama.Grammar.Companion.jsonSchema] for JSON that follows a schema).
+- Embeddings: [com.thalzeronlabs.llama.LlamaModel.embed] and [com.thalzeronlabs.llama.cosineSimilarity].
+- Resuming a conversation: [com.thalzeronlabs.llama.LlamaSession.saveState] and
+  [com.thalzeronlabs.llama.LlamaSession.loadState].
+- Numbers about a generation: [com.thalzeronlabs.llama.GenerationStats] in
+  [com.thalzeronlabs.llama.LlamaSession.lastStats].
+
 # Package com.thalzeronlabs.llama
 
-The whole public API: models, sessions, parameters, chat messages and generation statistics.
+The whole public API: models, sessions, grammars, embeddings, parameters, chat messages and generation statistics.
