@@ -24,8 +24,17 @@ add_subdirectory(${LLAMA_CPP_DIR} build-llama)
 
 add_library(llama_kotlin SHARED llama_jni.cpp)
 
-target_link_libraries(llama_kotlin PRIVATE llama android log)
+if(ANDROID)
+    target_link_libraries(llama_kotlin PRIVATE llama android log)
+else()
+    # Desktop build of the same JNI library, used only by the host integration tests (see CONTRIBUTING.md).
+    find_package(JNI REQUIRED)
+    target_include_directories(llama_kotlin PRIVATE ${JNI_INCLUDE_DIRS})
+    target_link_libraries(llama_kotlin PRIVATE llama)
+endif()
 
 # Keep only the JNI entry points visible; everything else stays internal to the .so.
 target_compile_options(llama_kotlin PRIVATE -fvisibility=hidden)
-target_link_options(llama_kotlin PRIVATE -Wl,--gc-sections -Wl,--exclude-libs,ALL)
+if(NOT APPLE)
+    target_link_options(llama_kotlin PRIVATE -Wl,--gc-sections -Wl,--exclude-libs,ALL)
+endif()

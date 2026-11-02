@@ -55,6 +55,16 @@ android {
 
     testOptions {
         unitTests.isReturnDefaultValues = true
+        // Host integration tests (NativeIntegrationTest, the GBNF validator check) run only when these are given,
+        // e.g. -Pllama.nativeLibDir=build-host -Pllama.testModel=... (see CONTRIBUTING.md).
+        unitTests.all { test ->
+            providers.gradleProperty("llama.nativeLibDir").orNull?.let {
+                test.systemProperty("java.library.path", rootProject.file(it).absolutePath)
+            }
+            listOf("llama.testModel", "llama.testEmbeddingModel", "llama.gbnfValidator").forEach { key ->
+                providers.gradleProperty(key).orNull?.let { test.systemProperty(key, rootProject.file(it).absolutePath) }
+            }
+        }
     }
 
     publishing {

@@ -13,6 +13,9 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.Closeable
+import java.io.File
+import java.io.FileNotFoundException
+import java.io.IOException
 import java.util.concurrent.Executors
 
 /**
@@ -26,7 +29,7 @@ class LlamaSession internal constructor(
     private val engine: Engine,
     private val formatChat: (List<ChatMessage>) -> String,
     private val dispatcher: CoroutineDispatcher = newSessionDispatcher(),
-    private val clock: () -> Long = System::currentTimeMillis,
+    private val clock: () -> Long = { System.nanoTime() / 1_000_000 },
     private val onClose: (LlamaSession) -> Unit = {},
 ) : Closeable {
 
@@ -44,46 +47,139 @@ class LlamaSession internal constructor(
      * The prompt is appended to what the session already holds, so consecutive calls keep the history.
      * @param maxTokens upper bound on generated tokens.
      * @param addSpecial add the model's begin-of-sequence token (true for the first prompt of a session).
+     * @param grammar restricts the output to a grammar, for example [Grammar.jsonSchema]; null means free text.
+     * @param stop ends the generation as soon as the output contains one of these strings. The stop sequence itself
+     *   is not emitted.
      */
-    fun generate(prompt: String, maxTokens: Int = 512, addSpecial: Boolean = true): Flow<String> =
-        stream(prompt, maxTokens, addSpecial, resetFirst = false)
+    fun generate(
+        prompt: String,
+        maxTokens: Int = 512,
+        addSpecial: Boolean = true,
+        grammar: Grammar? = null,
+        stop: List<String> = emptyList(),
+    ): Flow<String> = stream(maxTokens, grammar, stop) { engine.ingest(prompt, addSpecial).let { PromptIngest(it, 0) } }
 
     /**
      * Answers the last message of [messages] using the model's own chat template.
      *
-     * The whole conversation is re-sent on every call (the session is reset first), which keeps the API stateless:
-     * keep your message list, append the user's turn, call [chat], append the answer.
+     * Pass the whole conversation on every call: keep your message list, append the user's turn, call [chat],
+     * append the answer. The session keeps its KV cache between calls and only processes the part of the
+     * conversation it has not seen yet (see [GenerationStats.cachedPromptTokens]), so later turns start fast.
+     * A conversation that diverges from what the session holds is handled too: the cache is cut where they differ.
+     *
+     * @param grammar restricts the output to a grammar, for example [Grammar.jsonSchema]; null means free text.
+     * @param stop ends the generation as soon as the output contains one of these strings (not emitted).
      */
-    fun chat(messages: List<ChatMessage>, maxTokens: Int = 512): Flow<String> {
+    fun chat(
+        messages: List<ChatMessage>,
+        maxTokens: Int = 512,
+        grammar: Grammar? = null,
+        stop: List<String> = emptyList(),
+    ): Flow<String> {
         require(messages.isNotEmpty()) { "messages must not be empty" }
+        val prompt = formatChat(messages)
         // The chat template already contains the begin-of-sequence marker.
-        return stream(formatChat(messages), maxTokens, addSpecial = false, resetFirst = true)
+        return stream(maxTokens, grammar, stop) { engine.ingestReusingPrefix(prompt, addSpecial = false) }
     }
 
-    private fun stream(prompt: String, maxTokens: Int, addSpecial: Boolean, resetFirst: Boolean): Flow<String> = flow {
+    private fun stream(
+        maxTokens: Int,
+        grammar: Grammar?,
+        stop: List<String>,
+        ingestPrompt: () -> PromptIngest,
+    ): Flow<String> = flow {
         require(maxTokens > 0) { "maxTokens must be positive, was $maxTokens" }
         lock.withLock {
             check(!closed) { "This session is closed." }
-            if (resetFirst) engine.reset()
-            val promptTokens = engine.ingest(prompt, addSpecial)
-            val decoder = Utf8StreamDecoder()
             val started = clock()
+            engine.beginGeneration(grammar?.gbnf, grammar?.root)
+            val prompt = ingestPrompt()
+            val promptDone = clock()
+            val decoder = Utf8StreamDecoder()
+            val stopper = StopSequenceMatcher(stop)
             var generated = 0
+            var firstToken: Long? = null
+            var reason: StopReason? = null
             try {
-                while (generated < maxTokens && !closing) {
+                while (true) {
+                    if (closing) {
+                        reason = StopReason.CANCELLED
+                        break
+                    }
+                    if (generated >= maxTokens) {
+                        reason = StopReason.MAX_TOKENS
+                        break
+                    }
                     currentCoroutineContext().ensureActive()
-                    val bytes = engine.nextToken() ?: break
+                    val bytes = engine.nextToken()
+                    if (bytes == null) {
+                        reason = if (engine.usedTokens() + 1 >= engine.contextSize()) {
+                            StopReason.CONTEXT_FULL
+                        } else {
+                            StopReason.END_OF_GENERATION
+                        }
+                        break
+                    }
+                    if (firstToken == null) firstToken = clock()
                     generated++
-                    val text = decoder.push(bytes)
+                    val text = stopper.push(decoder.push(bytes))
                     if (text.isNotEmpty()) emit(text)
+                    if (stopper.stopped) {
+                        reason = StopReason.STOP_SEQUENCE
+                        break
+                    }
                 }
-                val tail = decoder.flush()
-                if (tail.isNotEmpty()) emit(tail)
+                if (reason != StopReason.STOP_SEQUENCE) {
+                    val tail = decoder.flush()
+                    var out = if (tail.isNotEmpty()) stopper.push(tail) else ""
+                    if (stopper.stopped) reason = StopReason.STOP_SEQUENCE else out += stopper.flush()
+                    if (out.isNotEmpty()) emit(out)
+                }
             } finally {
-                lastStats = GenerationStats(promptTokens, generated, clock() - started)
+                lastStats = GenerationStats(
+                    promptTokens = prompt.promptTokens,
+                    generatedTokens = generated,
+                    generationMillis = clock() - promptDone,
+                    promptMillis = promptDone - started,
+                    timeToFirstTokenMillis = firstToken?.let { it - started },
+                    cachedPromptTokens = prompt.reusedTokens,
+                    stopReason = reason ?: StopReason.CANCELLED,
+                )
             }
         }
     }.flowOn(dispatcher)
+
+    /**
+     * Saves the session content (the KV cache and its tokens) to [file], so the conversation can be resumed later,
+     * even after the app restarts, without processing the prompt again. Restore it with [loadState] on a session of
+     * the same model. The file holds the whole context: expect tens of megabytes for a long conversation.
+     */
+    suspend fun saveState(file: File) = withContext(dispatcher) {
+        lock.withLock {
+            check(!closed) { "This session is closed." }
+            val tmp = File(file.absoluteFile.parentFile, file.name + ".tmp")
+            engine.saveState(tmp.absolutePath)
+            if (!tmp.renameTo(file)) {
+                tmp.delete()
+                throw IOException("Could not move the saved state to ${file.absolutePath}")
+            }
+        }
+    }
+
+    /**
+     * Replaces what this session holds with a state saved by [saveState] and returns the number of tokens restored.
+     *
+     * The file must come from the same model file and library version, and fit in this session's context window;
+     * otherwise this throws [IOException] and the session is left empty. Continue with [chat] (pass the same
+     * conversation plus the new turn: the restored part is reused) or with [generate] (`addSpecial = false`).
+     */
+    suspend fun loadState(file: File): Int = withContext(dispatcher) {
+        lock.withLock {
+            check(!closed) { "This session is closed." }
+            if (!file.isFile) throw FileNotFoundException("No saved state at ${file.absolutePath}")
+            engine.loadState(file.absolutePath)
+        }
+    }
 
     /** Forgets the conversation so far. */
     suspend fun reset() = withContext(dispatcher) { lock.withLock { engine.reset() } }

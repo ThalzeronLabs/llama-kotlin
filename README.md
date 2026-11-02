@@ -9,6 +9,8 @@
 **Run large language models fully on-device on Android — with a small, coroutine-first Kotlin API over [llama.cpp](https://github.com/ggml-org/llama.cpp).**
 
 No server, no API key, no internet: load a GGUF model from storage and stream tokens into your UI as a Kotlin `Flow`.
+Get **guaranteed-valid JSON** out of free text, build **local semantic search** with embeddings, and **resume
+conversations** from disk without re-reading the prompt.
 
 ## Quick start
 
@@ -26,7 +28,7 @@ dependencyResolutionManagement {
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.ThalzeronLabs:llama-kotlin:v0.1.1")
+    implementation("com.github.ThalzeronLabs:llama-kotlin:v0.2.0")
 }
 ```
 
@@ -54,7 +56,7 @@ Every [GitHub release](https://github.com/ThalzeronLabs/llama-kotlin/releases) h
 
 ```kotlin
 dependencies {
-    implementation(files("libs/llama-kotlin-0.1.1.aar"))
+    implementation(files("libs/llama-kotlin-0.2.0.aar"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2") // not pulled in by a plain AAR
 }
 ```
@@ -65,13 +67,18 @@ dependencies {
 | | |
 |---|---|
 | **Coroutine-first** | `generate()` and `chat()` return a cold `Flow<String>`. Cancel the collecting coroutine and generation stops at the next token. |
+| **Structured output** | Pass a GBNF `Grammar`, or `Grammar.jsonSchema(...)`: llama.cpp's grammar sampler makes invalid output impossible, so the JSON always parses. |
+| **Embeddings** | `model.embed(text)` turns text into a vector (with the model's own pooling); `cosineSimilarity()` ranks it. Semantic search with no server. |
+| **Chat that remembers** | `chat()` keeps the KV cache between turns and only processes what is new: the second turn does not re-read the first. |
+| **Save and resume** | `saveState(file)` / `loadState(file)` write the KV cache to disk, so a conversation survives an app restart without re-processing the prompt. |
+| **Generation control** | Stop sequences, a fixed seed for reproducible answers, greedy or top-k → top-p → min-p → temperature sampling. |
+| **Honest stats** | `GenerationStats`: prompt and generation tokens/s, time to first token, cached prompt tokens, why it stopped. |
+| **Benchmark your phone** | A small [`benchmark`](benchmark/README.md) APK measures prompt and generation speed on a device through `adb`. |
 | **Thread-safe by design** | Each session owns one native thread. Call it from any coroutine; generations never interleave. |
 | **Emoji-safe streaming** | Tokens are bytes, not characters. A streaming UTF-8 decoder holds split characters back, so you never print `�`. |
 | **Chat templates built in** | `chat()` formats the conversation with the template stored inside the GGUF file (Qwen, Llama, Gemma, Phi…). |
-| **Sampling** | Greedy (`temperature = 0`) or top-k → top-p → min-p → temperature with a fixed seed. |
 | **Fast ARM kernels** | `arm64-v8a` is compiled for ARMv8.2 dot-product + fp16 (phones from ~2019 on); `x86_64` for emulators. |
-| **No leaks** | Models and sessions are `Closeable`; closing a model closes its sessions. |
-| **Tested** | The session logic (streaming, limits, cancellation, stats) runs against a fake engine in plain JVM unit tests on every push. |
+| **Tested for real** | Session logic runs against a fake engine in JVM tests; the same JNI code, built for Linux, runs against two tiny real models (generation, grammars, embeddings, saved state) on every push. |
 
 ## API at a glance
 
@@ -85,34 +92,168 @@ val session = model.newSession(
         contextSize = 2048,  // prompt + answer + history, in tokens
         temperature = 0.7f,  // 0 = greedy
         topK = 40, topP = 0.95f, minP = 0.05f,
+        seed = 42,           // same seed + same prompt = same answer
         threads = 0,         // 0 = auto (cores - 2, max 4)
     )
 )
 
-session.generate("Once upon a time", maxTokens = 128)   // raw completion, keeps history
-session.chat(messages, maxTokens = 512)                 // chat turn, stateless
-session.reset()                                         // forget the conversation
-session.usedTokens(); session.contextSize()
-session.lastStats                                       // prompt tokens, generated tokens, tokens/s
+session.generate("Once upon a time", maxTokens = 128)      // raw completion, keeps history
+session.chat(messages, maxTokens = 512)                    // chat turn; reuses the cached part of `messages`
+session.chat(messages, grammar = Grammar.jsonSchema(schema)) // output restricted to the schema
+session.chat(messages, stop = listOf("\n\n"))             // stop sequences (not emitted)
+session.saveState(file); session.loadState(file)           // KV cache to and from disk
+session.reset()                                            // forget the conversation
+session.lastStats                                          // tokens/s, time to first token, stop reason…
+
+model.embed("some text")                                   // FloatArray, normalized
+model.tokenCount("some text")
 ```
 
 A prompt that does not fit in what is left of the context window throws `ContextFullException`.
 Full reference: **[thalzeronlabs.github.io/llama-kotlin](https://thalzeronlabs.github.io/llama-kotlin/)**.
 
+## Structured output: free text in, a Kotlin object out
+
+A grammar decides which tokens the model is *allowed* to write, so the answer cannot be malformed: no
+"Sure! Here is your JSON:", no missing brace, no extra key. `Grammar.jsonSchema()` builds one from a JSON Schema
+(objects, arrays, strings, numbers, enums, `anyOf`, `$ref`, length and item bounds — see the
+[KDoc](https://thalzeronlabs.github.io/llama-kotlin/) for the exact subset). Decode it with
+[kotlinx.serialization](https://github.com/Kotlin/kotlinx.serialization), all offline:
+
+```kotlin
+@Serializable
+data class Contact(val name: String, val email: String?, val phone: String?, val company: String?)
+
+val contactSchema = Grammar.jsonSchema(
+    """
+    {"type": "object",
+     "properties": {
+       "name":    {"type": "string"},
+       "email":   {"type": ["string", "null"]},
+       "phone":   {"type": ["string", "null"]},
+       "company": {"type": ["string", "null"]}
+     },
+     "required": ["name", "email", "phone", "company"]}
+    """
+)
+
+suspend fun extractContact(session: LlamaSession, text: String): Contact {
+    val json = session.chat(
+        listOf(
+            ChatMessage.system("Extract the contact details from the user's message. Use null when a field is missing."),
+            ChatMessage.user(text),
+        ),
+        grammar = contactSchema,
+    ).toList().joinToString("")
+    return Json.decodeFromString<Contact>(json)   // always parses: the grammar allows nothing else
+}
+
+val contact = extractContact(session, "Hi, I'm Ana Souza from Thalzeron Labs. Write to ana@example.com.")
+```
+
+The grammar guarantees the *shape* as long as `maxTokens` leaves room for the whole answer (check
+`lastStats?.stopReason`: `MAX_TOKENS` means it was cut); how well the values are filled in depends on the model. Raw GBNF works too:
+`Grammar.gbnf("""root ::= "yes" | "no"""")`. Because `chat()` caches the conversation prefix, the system prompt
+is processed once and reused by every later extraction on the same session.
+
+## Embeddings and local semantic search
+
+Load an embedding model in GGUF — e.g. `bge-small-en-v1.5` (the one this project's tests use) — and turn text into
+vectors. Vectors are normalized, so cosine similarity is a plain dot product:
+
+```kotlin
+val embedder = LlamaModel.load(File(filesDir, "bge-small-en-v1.5-f16.gguf"))
+
+val notes = listOf(
+    "Buy milk, eggs and coffee",
+    "Dentist appointment on Friday at 3 pm",
+    "Slides for the Kotlin coroutines talk",
+)
+val index = notes.map { it to embedder.embed(it) }            // compute once, store anywhere (Room, a file…)
+
+suspend fun search(query: String, top: Int = 3): List<Pair<String, Float>> {
+    val q = embedder.embed(query)
+    return index.map { (note, v) -> note to cosineSimilarity(q, v) }
+        .sortedByDescending { it.second }
+        .take(top)
+}
+
+search("when do I see the doctor?")   // notes ranked by meaning, not by shared words
+```
+
+`embed()` uses the pooling the model declares (mean, CLS or last token) and creates its context on first use
+(`ModelParams.embeddingContextSize`, 512 tokens by default; longer text throws `ContextFullException`, so split it).
+
+## Generation control and statistics
+
+```kotlin
+val session = model.newSession(SessionParams(temperature = 0.8f, seed = 1234))
+
+session.generate("Write a haiku about Kotlin.", maxTokens = 64, stop = listOf("\n\n"))
+    .collect { print(it) }
+
+session.lastStats?.let { s ->
+    println("prompt: ${s.promptTokens} tokens (${s.cachedPromptTokens} from cache), ${s.promptTokensPerSecond} t/s")
+    println("answer: ${s.generatedTokens} tokens, ${s.tokensPerSecond} t/s, first token after ${s.timeToFirstTokenMillis} ms")
+    println("stopped because: ${s.stopReason}")  // END_OF_GENERATION, MAX_TOKENS, STOP_SEQUENCE, CONTEXT_FULL, CANCELLED
+}
+```
+
+- **Stop sequences** are matched across token boundaries and never reach your UI, even when split over tokens.
+- **Seed**: the sampler is rebuilt from `seed` before every generation, so the same seed, session content and prompt
+  give the same answer — in a new session or after `reset()` (on the same device and build).
+
+## Save and resume a conversation
+
+Processing a long prompt is the slow part on a phone. Save the KV cache once, restore it later — even after the
+process died — and continue without paying for it again:
+
+```kotlin
+session.chat(conversation).collect { /* … */ }
+session.saveState(File(filesDir, "chat-42.state"))
+
+// Later, maybe after an app restart:
+val resumed = model.newSession()
+resumed.loadState(File(filesDir, "chat-42.state"))
+resumed.chat(conversation + ChatMessage.user("And then?")).collect { /* … */ }
+// resumed.lastStats?.cachedPromptTokens: the restored part was not processed again
+```
+
+The file uses llama.cpp's session format and holds the whole context (it grows with the conversation). It only
+loads into a session of the **same model file** and library version, with a context window that is large enough;
+otherwise `loadState` throws `IOException` and the session is left empty.
+
+## Benchmark your phone
+
+The [`benchmark`](benchmark/README.md) module is a tiny APK without a screen. Install it, push a model and run:
+
+```bash
+adb shell am instrument -w -e model qwen2.5-0.5b-instruct-q4_k_m.gguf com.thalzeronlabs.llama.benchmark/.BenchmarkInstrumentation
+```
+
+It prints a Markdown table with prompt and generation tokens/s and time to first token, plus the device, SoC,
+thread count and thermal status — ready to paste into an issue.
+
 ## Tested models
 
 | Model | File | Size | Android phone (arm64) | Linux x86_64 host check* |
 |---|---|---|---|---|
-| [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF) | `qwen2.5-0.5b-instruct-q4_k_m.gguf` (Q4_K_M) | 491 MB | tokens/s **to be measured** | ✅ loads, chats, streams; 39–42 tokens/s |
+| [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF) | `qwen2.5-0.5b-instruct-q4_k_m.gguf` (Q4_K_M) | 491 MB | tokens/s **to be measured** | ✅ loads, chats, streams; 39–42 tokens/s (measured with v0.1.1) |
 
 \* The host check runs this library's real Kotlin API and JNI code, compiled for Linux instead of Android, on a
 4-thread Intel Xeon @ 2.1 GHz (greedy, 128 generated tokens, 4 runs). Its output matched llama.cpp's own
 `llama-simple` token for token on a test prompt. It shows the integration works — it is **not** a phone number.
 
+The host integration tests in CI also run two tiny models on Linux on every push:
+[`stories15M-q4_0`](https://huggingface.co/ggml-org/models/tree/main/tinyllamas) (generation, grammars, saved state)
+and [`bge-small` f16](https://huggingface.co/ggml-org/models/tree/main/bert-bge-small) (embeddings). Those checks
+are about correctness only; no speed is recorded.
+
 Any GGUF chat model that the pinned llama.cpp supports should work. Bigger models that are worth a try on
 phones with more RAM: Qwen2.5-1.5B-Instruct, Llama-3.2-3B-Instruct (Q4_K_M). Ran one on your phone?
 [Open an issue](https://github.com/ThalzeronLabs/llama-kotlin/issues/new/choose) with the device, model,
-quantization, context size, threads and `lastStats` — it goes in this table.
+quantization, context size, threads and `lastStats` — or simply the report of the [benchmark](benchmark/README.md) — it goes
+in this table.
 
 ## How it compares
 
@@ -127,8 +268,9 @@ There are several good ways to run an LLM on Android. Pick the one that fits:
 | API style | `Flow<String>`, `Closeable`, coroutines | Sample code you own and maintain | Google's inference API | Google's GenAI API |
 | Maturity | **0.x — new, small, API may change** | Maintained upstream | Google-maintained | Google-maintained |
 
-**What llama-kotlin does *not* do (yet):** GPU offload (Vulkan/OpenCL), embeddings, grammar / JSON-constrained
-output, multimodal input, LoRA adapters, saving/restoring the KV cache, 32-bit ARM (`armeabi-v7a`).
+**What llama-kotlin does *not* do (yet):** GPU offload (Vulkan/OpenCL), multimodal input, LoRA adapters,
+repetition penalties ([#2](https://github.com/ThalzeronLabs/llama-kotlin/issues/2), a good first issue),
+32-bit ARM (`armeabi-v7a`).
 If you need one of these, see the [issues](https://github.com/ThalzeronLabs/llama-kotlin/issues) — or help build it.
 
 ## How it works
@@ -142,8 +284,11 @@ JNI     llama_jni.cpp   (opaque handles, Java exceptions on failure)
 C++     llama.cpp (pinned as a git submodule)  →  ggml CPU kernels (NEON on ARM)
 ```
 
-The session ingests the prompt in batches, then loops: sample a token → feed it back → hand its bytes to Kotlin.
-The Kotlin side decodes UTF-8 across token boundaries, checks for cancellation between tokens and records timing.
+The session ingests the prompt in batches (reusing the longest prefix already in the KV cache), then loops:
+sample a token → feed it back → hand its bytes to Kotlin. With a grammar, the token is first sampled freely and only
+checked against the grammar; the full grammar pass over the vocabulary runs only when that token is rejected (the
+same trick llama.cpp uses). The Kotlin side decodes UTF-8 across token boundaries, holds back possible stop sequences,
+checks for cancellation between tokens and records timing.
 
 ## Requirements
 
@@ -155,6 +300,7 @@ git clone --recursive https://github.com/ThalzeronLabs/llama-kotlin
 cd llama-kotlin
 ./gradlew :llama:testDebugUnitTest   # JVM unit tests
 ./gradlew :llama:assembleRelease     # AAR with the native libraries
+scripts/host-test.sh                 # optional: the same tests against real llama.cpp and two tiny models (Linux)
 ```
 
 ## Contributing
