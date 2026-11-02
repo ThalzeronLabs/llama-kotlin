@@ -7,6 +7,7 @@
 // The file also builds on a desktop JVM (Linux/macOS) so the host integration tests can run it against a real
 // model; only logging differs.
 
+#include <dlfcn.h>
 #include <jni.h>
 
 #include <algorithm>
@@ -139,6 +140,40 @@ const std::vector<int> & fast_cores() {
         return fast.empty() ? all : fast;
     }();
     return cores;
+}
+
+// On arm64 Android the CPU backend comes as one library per feature level (see CMakeLists.txt). Asks each one how
+// well it fits this CPU (its ggml_backend_score() only checks the CPU features, it runs no vector code) and loads the
+// best, so a phone without dot-product gets the plain armv8.0 code instead of crashing with SIGILL. The libraries
+// are opened by file name: the app's linker namespace finds them inside the APK, extracted or not.
+void load_cpu_backend() {
+#ifdef GGML_BACKEND_DL
+    static const char * const variants[] = {
+        "libggml-cpu-android_armv9.0_1.so",
+        "libggml-cpu-android_armv8.6_1.so",
+        "libggml-cpu-android_armv8.2_2.so",
+        "libggml-cpu-android_armv8.2_1.so",
+        "libggml-cpu-android_armv8.0_1.so",
+    };
+    const char * best = nullptr;
+    int best_score = 0;
+    for (const char * name : variants) {
+        void * handle = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+        if (handle == nullptr) continue;
+        auto * score = reinterpret_cast<int (*)()>(dlsym(handle, "ggml_backend_score"));
+        const int s = score != nullptr ? score() : 0;
+        dlclose(handle);
+        if (s > best_score) {
+            best_score = s;
+            best = name;
+        }
+    }
+    if (best != nullptr && ggml_backend_load(best) != nullptr) {
+        LOGI("cpu backend: %s", best);
+    } else {
+        LOGI("no cpu backend could be loaded");
+    }
+#endif
 }
 
 // Default: one thread per fast core, at most 4 (past that, decoding is limited by memory bandwidth, not cores).
@@ -299,7 +334,10 @@ extern "C" {
 
 JNIEXPORT void JNICALL
 Java_com_thalzeronlabs_llama_NativeBridge_backendInit(JNIEnv *, jclass) {
-    std::call_once(g_backend_once, [] { llama_backend_init(); });
+    std::call_once(g_backend_once, [] {
+        load_cpu_backend();
+        llama_backend_init();
+    });
 }
 
 JNIEXPORT jlong JNICALL
