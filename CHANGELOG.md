@@ -6,6 +6,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Changed
+
+- **Generation runs on the fast cores, on a persistent thread pool.** Each session keeps one ggml thread pool pinned
+  to the phone's fast cores (detected from each core's maximum frequency) instead of letting ggml create and destroy
+  its worker threads on every token, and its own thread runs at display priority. Android tends to put an app's
+  worker threads on the slow cluster: on a POCO X6 Pro (Dimensity 8300, Android 16) with Qwen2.5 0.5B Q4_K_M the
+  on-device chat app went from 8.7 to 23.1 tok/s with the pool alone (`llama-simple`: 7.7 tok/s on the four
+  Cortex-A510s, 40.7 on the A715s). If Android refuses the CPU mask (an app in the background), the threads run
+  unpinned.
+- **Default threads:** `threads = 0` now means one thread per fast core, at most 4 (it was cores − 2, at most 4).
+
+### Fixed
+
+- **No more SIGILL on CPUs without dot-product.** The arm64 build was compiled for armv8.2-a+dotprod and crashed on
+  the first token on Cortex-A53/A73 phones and under the ARM translation of x86_64 emulators. It now ships ggml's
+  Android CPU variants (armv8.0, +dotprod, +fp16, +i8mm, +sve2) and loads the best one the CPU supports at start-up.
+
+### Not done, on purpose
+
+- **i8mm alone does not speed up generation**, so it is not forced on: on the same phone, a build with
+  `+i8mm` decoded at 34 tok/s against 32 without it (`llama-simple`, 3 runs each), within noise, because decoding is
+  bound by memory bandwidth. The variant loader still picks the i8mm build on phones that have it.
+
 ## [0.2.2] - 2026-11-02
 
 ### Fixed
