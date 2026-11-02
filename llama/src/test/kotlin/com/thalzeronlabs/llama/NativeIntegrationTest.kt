@@ -61,6 +61,23 @@ class NativeIntegrationTest {
     }
 
     @Test
+    fun `a per-call temperature applies to one generation and the session value comes back`() = runBlocking {
+        suspend fun LlamaSession.dog(temperature: Float? = null) =
+            generate("The dog", maxTokens = 32, temperature = temperature).toList().joinToString("")
+
+        val greedy = session(temperature = 0f).use { it.dog() }
+        val warm77 = session(temperature = 0.9f, seed = 77).use { it.dog() }
+        session(temperature = 0.9f, seed = 77).use { s ->
+            assertEquals(greedy, s.dog(temperature = 0f)) // override for this call
+            s.reset()
+            assertEquals(warm77, s.dog()) // back to the session's own temperature
+        }
+        // A greedy session raised to 0.9 for one call samples like a 0.9 session with the same seed.
+        val warm1 = session(temperature = 0.9f, seed = 1).use { it.dog() }
+        session(temperature = 0f, seed = 1).use { s -> assertEquals(warm1, s.dog(temperature = 0.9f)) }
+    }
+
+    @Test
     fun `a GBNF grammar restricts the output`() = runBlocking {
         session(temperature = 0.8f).use { s ->
             repeat(3) {

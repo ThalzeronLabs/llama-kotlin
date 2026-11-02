@@ -363,14 +363,17 @@ Java_com_thalzeronlabs_llama_NativeBridge_freeSession(JNIEnv *, jclass, jlong ha
     delete s;
 }
 
-// Rebuilds the sampler chain (fresh random state from the seed) and installs the grammar,
-// if any. Throws IllegalArgumentException when the grammar does not parse.
+// Rebuilds the sampler chain (fresh random state from the seed) for one generation and installs the grammar,
+// if any. A temperature >= 0 overrides the session's for this generation only. Throws IllegalArgumentException
+// when the grammar does not parse.
 JNIEXPORT void JNICALL
 Java_com_thalzeronlabs_llama_NativeBridge_beginGeneration(
-        JNIEnv * env, jclass, jlong handle, jstring jgrammar, jstring jroot) {
+        JNIEnv * env, jclass, jlong handle, jstring jgrammar, jstring jroot, jfloat temperature) {
     auto * s = reinterpret_cast<Session *>(handle);
     free_samplers(s);
-    s->chain = build_chain(s->sampling);
+    SamplingConfig config = s->sampling;
+    if (temperature >= 0.0f) config.temperature = temperature;
+    s->chain = build_chain(config);
     if (jgrammar != nullptr) {
         const std::string grammar = to_std_string(env, jgrammar);
         const std::string root = to_std_string(env, jroot);

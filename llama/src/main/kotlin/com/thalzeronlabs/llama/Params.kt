@@ -31,7 +31,10 @@ data class SessionParams(
     val batchSize: Int = 512,
     /** CPU threads; 0 picks a safe default for the device (cores - 2, at most 4). */
     val threads: Int = 0,
-    /** 0 means greedy (always the most likely token); higher is more creative. */
+    /**
+     * 0 means greedy (always the most likely token); higher is more creative. A single call can override it with
+     * the `temperature` parameter of [LlamaSession.chat] or [LlamaSession.generate].
+     */
     val temperature: Float = 0.7f,
     val topK: Int = 40,
     val topP: Float = 0.95f,

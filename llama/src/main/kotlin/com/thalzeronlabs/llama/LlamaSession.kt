@@ -50,6 +50,8 @@ class LlamaSession internal constructor(
      * @param grammar restricts the output to a grammar, for example [Grammar.jsonSchema]; null means free text.
      * @param stop ends the generation as soon as the output contains one of these strings. The stop sequence itself
      *   is not emitted.
+     * @param temperature overrides [SessionParams.temperature] for this call only (0 = greedy); null keeps the
+     *   session's value. The KV cache is kept, so changing it costs nothing.
      */
     fun generate(
         prompt: String,
@@ -57,7 +59,10 @@ class LlamaSession internal constructor(
         addSpecial: Boolean = true,
         grammar: Grammar? = null,
         stop: List<String> = emptyList(),
-    ): Flow<String> = stream(maxTokens, grammar, stop) { engine.ingest(prompt, addSpecial).let { PromptIngest(it, 0) } }
+        temperature: Float? = null,
+    ): Flow<String> = stream(maxTokens, grammar, stop, temperature) {
+        engine.ingest(prompt, addSpecial).let { PromptIngest(it, 0) }
+    }
 
     /**
      * Answers the last message of [messages] using the model's own chat template.
@@ -69,30 +74,47 @@ class LlamaSession internal constructor(
      *
      * @param grammar restricts the output to a grammar, for example [Grammar.jsonSchema]; null means free text.
      * @param stop ends the generation as soon as the output contains one of these strings (not emitted).
+     * @param temperature overrides [SessionParams.temperature] for this answer only (0 = greedy); null keeps the
+     *   session's value. Use it for a "creativity" setting instead of opening a new session: the cache is kept.
      */
     fun chat(
         messages: List<ChatMessage>,
         maxTokens: Int = 512,
         grammar: Grammar? = null,
         stop: List<String> = emptyList(),
+        temperature: Float? = null,
     ): Flow<String> {
         require(messages.isNotEmpty()) { "messages must not be empty" }
         val prompt = formatChat(messages)
         // The chat template already contains the begin-of-sequence marker.
-        return stream(maxTokens, grammar, stop) { engine.ingestReusingPrefix(prompt, addSpecial = false) }
+        return stream(maxTokens, grammar, stop, temperature) { engine.ingestReusingPrefix(prompt, addSpecial = false) }
     }
 
     private fun stream(
         maxTokens: Int,
         grammar: Grammar?,
         stop: List<String>,
+        temperature: Float?,
+        ingestPrompt: () -> PromptIngest,
+    ): Flow<String> {
+        require(temperature == null || (temperature >= 0f && temperature.isFinite())) {
+            "temperature must be finite and not negative, was $temperature"
+        }
+        return generation(maxTokens, grammar, stop, temperature, ingestPrompt)
+    }
+
+    private fun generation(
+        maxTokens: Int,
+        grammar: Grammar?,
+        stop: List<String>,
+        temperature: Float?,
         ingestPrompt: () -> PromptIngest,
     ): Flow<String> = flow {
         require(maxTokens > 0) { "maxTokens must be positive, was $maxTokens" }
         lock.withLock {
             check(!closed) { "This session is closed." }
             val started = clock()
-            engine.beginGeneration(grammar?.gbnf, grammar?.root)
+            engine.beginGeneration(grammar?.gbnf, grammar?.root, temperature)
             val prompt = ingestPrompt()
             val promptDone = clock()
             val decoder = Utf8StreamDecoder()

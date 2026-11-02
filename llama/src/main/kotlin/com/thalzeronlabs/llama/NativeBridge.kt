@@ -37,7 +37,8 @@ internal object NativeBridge {
     ): Long
 
     @JvmStatic external fun freeSession(session: Long)
-    @JvmStatic external fun beginGeneration(session: Long, grammar: String?, grammarRoot: String?)
+    /** [temperature] < 0 keeps the session's temperature. */
+    @JvmStatic external fun beginGeneration(session: Long, grammar: String?, grammarRoot: String?, temperature: Float)
     @JvmStatic external fun ingest(session: Long, text: String, addSpecial: Boolean): Int
     @JvmStatic external fun ingestReusingPrefix(session: Long, text: String, addSpecial: Boolean): IntArray
     @JvmStatic external fun nextToken(session: Long): ByteArray?
