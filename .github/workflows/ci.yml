@@ -29,6 +29,9 @@ jobs:
       - name: Unit tests
         run: ./gradlew :llama:testDebugUnitTest :benchmark:testDebugUnitTest
 
+      - name: The module still builds when included as a git submodule
+        run: ./gradlew -p samples/submodule-consumer :app:compileDebugKotlin
+
       - name: Build the AAR (arm64-v8a + x86_64) and the benchmark APK
         run: ./gradlew :llama:assembleRelease :benchmark:assembleRelease
 

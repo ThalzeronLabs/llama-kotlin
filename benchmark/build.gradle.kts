@@ -13,8 +13,9 @@ android {
         minSdk = 26
         targetSdk = 37
         versionCode = 1
-        versionName = providers.gradleProperty("VERSION_NAME").get()
-        buildConfigField("String", "LIBRARY_VERSION", "\"${providers.gradleProperty("VERSION_NAME").get()}\"")
+        val libraryVersion = providers.gradleProperty("VERSION_NAME").orElse("unspecified").get()
+        versionName = libraryVersion
+        buildConfigField("String", "LIBRARY_VERSION", "\"$libraryVersion\"")
 
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")

@@ -28,7 +28,7 @@ dependencyResolutionManagement {
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.ThalzeronLabs:llama-kotlin:v0.2.1")
+    implementation("com.github.ThalzeronLabs:llama-kotlin:v0.2.2")
 }
 ```
 
@@ -56,10 +56,32 @@ Every [GitHub release](https://github.com/ThalzeronLabs/llama-kotlin/releases) h
 
 ```kotlin
 dependencies {
-    implementation(files("libs/llama-kotlin-0.2.1.aar"))
+    implementation(files("libs/llama-kotlin-0.2.2.aar"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2") // not pulled in by a plain AAR
 }
 ```
+</details>
+
+<details>
+<summary>Prefer the source? Include the module from a git submodule.</summary>
+
+```bash
+git submodule add https://github.com/ThalzeronLabs/llama-kotlin
+git submodule update --init --recursive
+```
+
+```kotlin
+// settings.gradle.kts
+include(":llama")
+project(":llama").projectDir = file("llama-kotlin/llama")
+
+// app/build.gradle.kts
+dependencies { implementation(project(":llama")) }
+```
+
+Your version catalog needs `android-library` (plugin), `kotlinx-coroutines-core`, `kotlinx-coroutines-test` and `junit`
+entries, and the NDK and CMake versions from [Requirements](#requirements). Nothing else is required: no Dokka, no
+`VERSION_NAME`. [`samples/submodule-consumer`](samples/submodule-consumer) is a complete example, compiled by CI.
 </details>
 
 ## Features

@@ -8,6 +8,7 @@ on:
       - "llama/src/main/**"
       - "llama/Module.md"
       - "llama/build.gradle.kts"
+      - "build.gradle.kts"
       - ".github/workflows/docs.yml"
   workflow_dispatch:
 
