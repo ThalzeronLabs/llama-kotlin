@@ -12,11 +12,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "llama.h"
 
 #define LOG_TAG "llama-kotlin"
@@ -41,6 +44,7 @@ struct SamplingConfig {
 
 struct Session {
     llama_context *     ctx     = nullptr;
+    ggml_threadpool *   pool    = nullptr; // persistent worker threads on the fast cores (see make_pool())
     llama_sampler *     chain   = nullptr; // everything but the grammar
     llama_sampler *     grammar = nullptr; // optional, applied lazily (see sample())
     llama_batch_ext *   batch   = nullptr;
@@ -112,10 +116,70 @@ jstring utf8_to_jstring(JNIEnv * env, const std::string & text) {
     return result;
 }
 
+// The cores worth computing on. Phones mix a slow cluster with fast ones, and Android tends to run an app's worker
+// threads on the slow one: on a Dimensity 8300 the same model decodes at 7.7 tok/s on the four Cortex-A510s and at
+// 40+ on the Cortex-A715s. Returns the cores whose maximum frequency is above the slowest cluster's, or every core
+// when they are all alike or the frequencies cannot be read (desktop, emulator).
+const std::vector<int> & fast_cores() {
+    static const std::vector<int> cores = [] {
+        const int n = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+        std::vector<long> freq(n, 0);
+        for (int i = 0; i < n; ++i) {
+            std::ifstream in("/sys/devices/system/cpu/cpu" + std::to_string(i) + "/cpufreq/cpuinfo_max_freq");
+            if (!(in >> freq[i])) freq[i] = 0;
+        }
+        std::vector<int> all(n);
+        for (int i = 0; i < n; ++i) all[i] = i;
+        if (std::any_of(freq.begin(), freq.end(), [](long f) { return f <= 0; })) return all;
+        const long slowest = *std::min_element(freq.begin(), freq.end());
+        std::vector<int> fast;
+        for (int i = 0; i < n; ++i) {
+            if (freq[i] > slowest) fast.push_back(i);
+        }
+        return fast.empty() ? all : fast;
+    }();
+    return cores;
+}
+
+// Default: one thread per fast core, at most 4 (past that, decoding is limited by memory bandwidth, not cores).
 int resolve_threads(jint n_threads) {
-    return n_threads > 0
-            ? n_threads
-            : std::max(1, std::min(4, static_cast<int>(std::thread::hardware_concurrency()) - 2));
+    return n_threads > 0 ? n_threads : std::max(1, std::min(4, static_cast<int>(fast_cores().size())));
+}
+
+// A persistent thread pool pinned to the fast cores. Without one, ggml creates and destroys its worker threads on
+// every token and the scheduler is free to put them on the slow cores (measured: 32 -> 50 tok/s with the pool).
+// The pool starts paused so ggml pins the thread that computes (the session's own thread, which also does a share
+// of the work) on the first decode, rather than the thread that happens to create the session. The functions come
+// from the CPU backend's registry so this keeps working when the backend is a separately loaded library.
+ggml_threadpool * make_pool(int threads) {
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (dev == nullptr) return nullptr;
+    auto * pool_new = reinterpret_cast<decltype(ggml_threadpool_new) *>(
+            ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_threadpool_new"));
+    if (pool_new == nullptr) return nullptr;
+
+    ggml_threadpool_params params = ggml_threadpool_params_default(threads);
+    params.paused = true;
+    const auto & cores = fast_cores();
+    // Pin only when every thread gets a fast core of its own; asked for more threads than that, let the scheduler
+    // spread them. If Android refuses the mask (the app in the background is limited to the slow cores), ggml
+    // logs it and the threads simply run unpinned.
+    if (threads <= static_cast<int>(cores.size()) &&
+        cores.size() < static_cast<size_t>(std::thread::hardware_concurrency())) {
+        for (int core : cores) {
+            if (core < GGML_MAX_N_THREADS) params.cpumask[core] = true;
+        }
+        params.strict_cpu = true;
+    }
+    return pool_new(&params);
+}
+
+void free_pool(ggml_threadpool * pool) {
+    if (pool == nullptr) return;
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    auto * pool_free = reinterpret_cast<decltype(ggml_threadpool_free) *>(
+            ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_threadpool_free"));
+    if (pool_free != nullptr) pool_free(pool);
 }
 
 std::vector<llama_token> tokenize(const llama_vocab * vocab, const std::string & text, bool add_special) {
@@ -340,6 +404,8 @@ Java_com_thalzeronlabs_llama_NativeBridge_newSession(
 
     auto * s = new Session();
     s->ctx = ctx;
+    s->pool = make_pool(threads);
+    if (s->pool != nullptr) llama_attach_threadpool(ctx, s->pool, nullptr);
     s->batch = llama_batch_ext_init(ctx);
     s->vocab = llama_model_get_vocab(model);
     s->n_batch = n_batch;
@@ -349,7 +415,8 @@ Java_com_thalzeronlabs_llama_NativeBridge_newSession(
     s->sampling.min_p = min_p;
     s->sampling.seed = static_cast<uint32_t>(seed);
     s->chain = build_chain(s->sampling);
-    LOGI("session ready: n_ctx=%d n_batch=%d threads=%d", n_ctx, n_batch, threads);
+    LOGI("session ready: n_ctx=%d n_batch=%d threads=%d fast_cores=%zu pool=%s", n_ctx, n_batch, threads,
+         fast_cores().size(), s->pool != nullptr ? "pinned" : "none");
     return reinterpret_cast<jlong>(s);
 }
 
@@ -360,6 +427,7 @@ Java_com_thalzeronlabs_llama_NativeBridge_freeSession(JNIEnv *, jclass, jlong ha
     free_samplers(s);
     llama_batch_ext_free(s->batch);
     llama_free(s->ctx);
+    free_pool(s->pool); // after the context, which uses it
     delete s;
 }
 
