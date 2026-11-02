@@ -6,6 +6,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-02
+
+### Fixed
+
+- Including `:llama` from a git submodule no longer requires the including project to declare `VERSION_NAME` (it
+  falls back to `unspecified`) or a Dokka entry in its version catalog (Dokka is now configured by this repository's
+  root build only). `samples/submodule-consumer`, compiled in CI, keeps that setup working. The library code is
+  unchanged from 0.2.1.
+
 ## [0.2.1] - 2026-11-02
 
 ### Added
@@ -80,7 +89,8 @@ First public release.
 - Contributor guide, code of conduct, issue and pull request templates.
 - `kotlinx-coroutines-core` is exposed as an `api` dependency, because `Flow` is part of the public API.
 
-[Unreleased]: https://github.com/ThalzeronLabs/llama-kotlin/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/ThalzeronLabs/llama-kotlin/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/ThalzeronLabs/llama-kotlin/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/ThalzeronLabs/llama-kotlin/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ThalzeronLabs/llama-kotlin/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/ThalzeronLabs/llama-kotlin/compare/v0.1.0...v0.1.1

@@ -1,11 +1,13 @@
+// This module also builds when another project includes it as a git submodule. So it needs nothing from the
+// including build beyond the Android library plugin and the libraries below: the version falls back to
+// "unspecified", and Dokka is configured by this repository's root build.gradle.kts, not here.
 plugins {
     alias(libs.plugins.android.library)
-    alias(libs.plugins.dokka)
     `maven-publish`
 }
 
 group = "com.github.ThalzeronLabs"
-version = providers.gradleProperty("VERSION_NAME").get()
+version = providers.gradleProperty("VERSION_NAME").orElse("unspecified").get()
 
 android {
     namespace = "com.thalzeronlabs.llama"
@@ -80,18 +82,6 @@ dependencies {
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
-}
-
-dokka {
-    moduleName.set("llama-kotlin")
-    dokkaSourceSets.configureEach {
-        includes.from("Module.md")
-        sourceLink {
-            localDirectory.set(file("src/main/kotlin"))
-            remoteUrl("https://github.com/ThalzeronLabs/llama-kotlin/blob/main/llama/src/main/kotlin")
-            remoteLineSuffix.set("#L")
-        }
-    }
 }
 
 // AGP creates the "release" software component late, hence afterEvaluate.

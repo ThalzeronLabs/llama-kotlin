@@ -57,6 +57,7 @@ Speeds on a desktop CPU say nothing about phones: never report them as Android n
 | `llama/src/main/kotlin/.../NativeBridge.kt` | The `external` JNI declarations |
 | `llama/src/main/cpp/llama_jni.cpp` | The JNI implementation on top of llama.cpp |
 | `benchmark/` | The on-device benchmark APK (`adb shell am instrument`), see [benchmark/README.md](benchmark/README.md) |
+| `samples/submodule-consumer/` | An app that includes `:llama` as a git submodule; CI compiles it. Keep `llama/build.gradle.kts` free of anything an including build would have to declare (Dokka lives in the root `build.gradle.kts`) |
 | `scripts/host-test.sh` | Builds the JNI code for the desktop and runs the tests against real models |
 | `third_party/llama.cpp` | llama.cpp, pinned as a git submodule |
 
