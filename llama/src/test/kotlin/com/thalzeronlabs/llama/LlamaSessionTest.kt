@@ -28,14 +28,16 @@ class LlamaSessionTest {
     private class FakeEngine(private val tokens: List<ByteArray>, private val context: Int = 2048) : Engine {
         val ingested = mutableListOf<Pair<String, Boolean>>()
         val grammars = mutableListOf<Pair<String?, String?>>()
+        val temperatures = mutableListOf<Float?>()
         val history = mutableListOf<String>()
         var resets = 0
         var closed = false
         var nextTokenCalls = 0
         private var next = 0
 
-        override fun beginGeneration(grammar: String?, grammarRoot: String?) {
+        override fun beginGeneration(grammar: String?, grammarRoot: String?, temperature: Float?) {
             grammars += grammar to grammarRoot
+            temperatures += temperature
             next = 0
         }
 
@@ -162,7 +164,7 @@ class LlamaSessionTest {
     fun `a grammar the engine rejects fails the generation before the prompt is processed`() = runTest {
         val engine = object : Engine by FakeEngine(tokens("a")) {
             var ingestCalls = 0
-            override fun beginGeneration(grammar: String?, grammarRoot: String?) {
+            override fun beginGeneration(grammar: String?, grammarRoot: String?, temperature: Float?) {
                 if (grammar != null) throw IllegalArgumentException("bad grammar")
             }
             override fun ingest(text: String, addSpecial: Boolean): Int = 1.also { ingestCalls++ }
@@ -170,6 +172,41 @@ class LlamaSessionTest {
         val failure = runCatching { session(engine).generate("x", grammar = Grammar.gbnf("root ::= (")).toList() }
         assertTrue(failure.exceptionOrNull() is IllegalArgumentException)
         assertEquals(0, engine.ingestCalls)
+    }
+
+    // --- per-call temperature ------------------------------------------------------------------------------------
+
+    @Test
+    fun `a per-call temperature reaches the engine for that generation only`() = runTest {
+        val engine = FakeEngine(tokens("a"))
+        val s = session(engine)
+        s.chat(listOf(ChatMessage.user("hi")), temperature = 0.2f).toList()
+        s.chat(listOf(ChatMessage.user("hi")), temperature = 0f).toList()
+        s.chat(listOf(ChatMessage.user("hi"))).toList()
+        s.generate("x", addSpecial = false, temperature = 1.3f).toList()
+        assertEquals(listOf(0.2f, 0f, null, 1.3f), engine.temperatures)
+    }
+
+    @Test
+    fun `changing the temperature keeps the cache`() = runTest {
+        val engine = FakeEngine(tokens("ok"))
+        val s = session(engine)
+        val messages = listOf(ChatMessage.user("a"), ChatMessage.user("b"))
+        s.chat(messages, temperature = 0.9f).toList()
+        s.chat(messages, temperature = 0.1f).toList()
+        assertEquals(1, s.lastStats!!.cachedPromptTokens)
+        assertEquals(0, engine.resets)
+    }
+
+    @Test
+    fun `invalid per-call temperatures are rejected when the call is made`() {
+        val s = session(FakeEngine(tokens("a")))
+        for (bad in listOf(-0.1f, Float.NaN, Float.POSITIVE_INFINITY)) {
+            val chat = runCatching { s.chat(listOf(ChatMessage.user("x")), temperature = bad) }.exceptionOrNull()
+            assertTrue("chat accepted $bad", chat is IllegalArgumentException)
+            val generate = runCatching { s.generate("x", temperature = bad) }.exceptionOrNull()
+            assertTrue("generate accepted $bad", generate is IllegalArgumentException)
+        }
     }
 
     // --- stop sequences ----------------------------------------------------------------------------------------

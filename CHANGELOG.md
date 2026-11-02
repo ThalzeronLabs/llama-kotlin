@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-02
+
+### Added
+
+- `temperature` parameter on `chat()` and `generate()`: overrides `SessionParams.temperature` for that call only
+  (`null`, the default, keeps the session's value). Changing it keeps the KV cache, so an app no longer has to open a
+  new session (and re-process the conversation) when the user changes the temperature. Closes #10.
+
 ## [0.2.0] - 2026-11-02
 
 ### Added
@@ -72,7 +80,8 @@ First public release.
 - Contributor guide, code of conduct, issue and pull request templates.
 - `kotlinx-coroutines-core` is exposed as an `api` dependency, because `Flow` is part of the public API.
 
-[Unreleased]: https://github.com/ThalzeronLabs/llama-kotlin/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/ThalzeronLabs/llama-kotlin/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/ThalzeronLabs/llama-kotlin/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ThalzeronLabs/llama-kotlin/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/ThalzeronLabs/llama-kotlin/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ThalzeronLabs/llama-kotlin/releases/tag/v0.1.0

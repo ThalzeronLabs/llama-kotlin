@@ -28,7 +28,7 @@ dependencyResolutionManagement {
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.ThalzeronLabs:llama-kotlin:v0.2.0")
+    implementation("com.github.ThalzeronLabs:llama-kotlin:v0.2.1")
 }
 ```
 
@@ -56,7 +56,7 @@ Every [GitHub release](https://github.com/ThalzeronLabs/llama-kotlin/releases) h
 
 ```kotlin
 dependencies {
-    implementation(files("libs/llama-kotlin-0.2.0.aar"))
+    implementation(files("libs/llama-kotlin-0.2.1.aar"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2") // not pulled in by a plain AAR
 }
 ```
@@ -101,6 +101,7 @@ session.generate("Once upon a time", maxTokens = 128)      // raw completion, ke
 session.chat(messages, maxTokens = 512)                    // chat turn; reuses the cached part of `messages`
 session.chat(messages, grammar = Grammar.jsonSchema(schema)) // output restricted to the schema
 session.chat(messages, stop = listOf("\n\n"))             // stop sequences (not emitted)
+session.chat(messages, temperature = 0.2f)                 // this answer only; the cache is kept
 session.saveState(file); session.loadState(file)           // KV cache to and from disk
 session.reset()                                            // forget the conversation
 session.lastStats                                          // tokens/s, time to first token, stop reason…
@@ -202,6 +203,9 @@ session.lastStats?.let { s ->
 - **Stop sequences** are matched across token boundaries and never reach your UI, even when split over tokens.
 - **Seed**: the sampler is rebuilt from `seed` before every generation, so the same seed, session content and prompt
   give the same answer — in a new session or after `reset()` (on the same device and build).
+- **Temperature per call**: `chat(messages, temperature = 0.2f)` or `generate(prompt, temperature = 0f)` overrides
+  `SessionParams.temperature` for that call only; the next call uses the session's value again. Wire it to a
+  "creativity" slider without opening a new session, so the cached conversation is not processed again.
 
 ## Save and resume a conversation
 

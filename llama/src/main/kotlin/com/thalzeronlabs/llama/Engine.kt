@@ -6,10 +6,11 @@ package com.thalzeronlabs.llama
  */
 internal interface Engine {
     /**
-     * Rebuilds the sampler before a generation: fresh random state from the seed, and the
-     * grammar (GBNF text + root rule), if any. Throws [IllegalArgumentException] if the grammar does not parse.
+     * Rebuilds the sampler before a generation: fresh random state from the seed, the temperature (null = the
+     * session's), and the grammar (GBNF text + root rule), if any. Throws [IllegalArgumentException] if the grammar
+     * does not parse.
      */
-    fun beginGeneration(grammar: String?, grammarRoot: String?)
+    fun beginGeneration(grammar: String?, grammarRoot: String?, temperature: Float?)
 
     /** Appends text to what the session holds and returns how many tokens it took. */
     fun ingest(text: String, addSpecial: Boolean): Int
@@ -39,8 +40,8 @@ internal interface Engine {
 internal data class PromptIngest(val promptTokens: Int, val reusedTokens: Int)
 
 internal class NativeEngine(private val handle: Long) : Engine {
-    override fun beginGeneration(grammar: String?, grammarRoot: String?) =
-        NativeBridge.beginGeneration(handle, grammar, grammarRoot)
+    override fun beginGeneration(grammar: String?, grammarRoot: String?, temperature: Float?) =
+        NativeBridge.beginGeneration(handle, grammar, grammarRoot, temperature ?: -1f)
 
     override fun ingest(text: String, addSpecial: Boolean) = NativeBridge.ingest(handle, text, addSpecial)
 
