@@ -264,7 +264,7 @@ thread count and thermal status — ready to paste into an issue.
 
 | Model | File | Size | Android phone (arm64) | Linux x86_64 host check* |
 |---|---|---|---|---|
-| [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF) | `qwen2.5-0.5b-instruct-q4_k_m.gguf` (Q4_K_M) | 491 MB | POCO X6 Pro: see [Speed on a real phone](#speed-on-a-real-phone) | ✅ loads, chats, streams; 39–42 tokens/s (measured with v0.1.1) |
+| [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF) | `qwen2.5-0.5b-instruct-q4_k_m.gguf` (Q4_K_M) | 491 MB | POCO X6 Pro: see [Speed on a real phone](#speed-on-a-real-phone) | ✅ loads, chats, streams; 39–42 tokens/s on the host, not a phone (v0.1.1) |
 
 \* The host check runs this library's real Kotlin API and JNI code, compiled for Linux instead of Android, on a
 4-thread Intel Xeon @ 2.1 GHz (greedy, 128 generated tokens, 4 runs). Its output matched llama.cpp's own
@@ -286,10 +286,14 @@ Qwen2.5-0.5B-Instruct Q4_K_M, 4 threads, generation (decode) speed:
 | Before this release, inside the [on-device chat app](https://github.com/ThalzeronLabs/android-on-device-llm) | 7.4–8.8 |
 | The fast cores, worker threads recreated on every token (`llama-simple`) | 40.7 |
 | The fast cores, persistent pinned thread pool (`llama-bench --cpu-mask 0xf0 --cpu-strict 1`) | 49.7 |
-| With this release (pinned pool, session thread at display priority), inside the same app | 23.1 with the pool alone; full measurement pending |
+| With this release, inside the same app: one long answer | 33.3 |
+| With this release, inside the same app: back-to-back answers for 5 minutes (CPU 51–71 °C, no throttling) | 31.8 → 22.3, median 27.4 |
+| With this release, the app in the background (Android keeps background apps on the slow cores) | 5.3 |
 
 The lesson: on a big.LITTLE phone the speed depends more on *which* cores run the model than on the CPU kernels.
 `+i8mm` kernels did not change decode speed (34 vs 32 tok/s): decoding a small model is bound by memory bandwidth.
+The same goes for SVE: the armv9 build matched the armv8.6 build on decode (45.1 vs 45.6 tok/s) and was about 11%
+slower on the prompt. The app still trails the bare `llama-bench` number by about a third; profiling that gap is next.
 
 Any GGUF chat model that the pinned llama.cpp supports should work. Bigger models that are worth a try on
 phones with more RAM: Qwen2.5-1.5B-Instruct, Llama-3.2-3B-Instruct (Q4_K_M). Ran one on your phone?
