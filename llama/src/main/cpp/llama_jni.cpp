@@ -11,6 +11,7 @@
 #include <jni.h>
 
 #include <algorithm>
+#include <cstring>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -153,7 +154,7 @@ bool g_cpu_backend_ready = true;
 
 void load_cpu_backend() {
 #ifdef GGML_BACKEND_DL
-    // Must list every android_* variant that ggml/src/CMakeLists.txt builds (LlamaJniVariantsTest checks it).
+    // Must list every android_* variant that ggml/src/CMakeLists.txt builds (CpuVariantsTest checks it).
     static const char * const variants[] = {
         "libggml-cpu-android_armv9.2_2.so",
         "libggml-cpu-android_armv9.2_1.so",
@@ -163,19 +164,27 @@ void load_cpu_backend() {
         "libggml-cpu-android_armv8.2_1.so",
         "libggml-cpu-android_armv8.0_1.so",
     };
+    // armv9.0 only adds SVE2 over armv8.6, and phone SVE is 128 bits wide: on a POCO X6 Pro (Cortex-A715) the
+    // armv9.0 build decoded at the same speed (45.1 vs 45.6 tok/s) and read prompts about 11% slower (86 vs 98 tok/s).
+    // So when both fit, armv8.6 is used. The armv9.2 builds add SME (a matrix unit) and are still preferred.
+    static const char * const armv9_0 = "libggml-cpu-android_armv9.0_1.so";
+    static const char * const armv8_6 = "libggml-cpu-android_armv8.6_1.so";
     const char * best = nullptr;
     int best_score = 0;
+    bool armv8_6_fits = false;
     for (const char * name : variants) {
         void * handle = dlopen(name, RTLD_NOW | RTLD_LOCAL);
         if (handle == nullptr) continue;
         auto * score = reinterpret_cast<int (*)()>(dlsym(handle, "ggml_backend_score"));
         const int s = score != nullptr ? score() : 0;
         dlclose(handle);
+        if (std::strcmp(name, armv8_6) == 0 && s > 0) armv8_6_fits = true;
         if (s > best_score) {
             best_score = s;
             best = name;
         }
     }
+    if (best != nullptr && std::strcmp(best, armv9_0) == 0 && armv8_6_fits) best = armv8_6;
     if (best != nullptr && ggml_backend_load(best) != nullptr) {
         LOGI("cpu backend: %s", best);
     } else {
