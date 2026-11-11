@@ -137,6 +137,8 @@ const std::vector<int> & fast_cores() {
         for (int i = 0; i < n; ++i) {
             if (freq[i] > slowest) fast.push_back(i);
         }
+        // Fastest first, so a pool smaller than the fast cluster still gets the prime core.
+        std::stable_sort(fast.begin(), fast.end(), [&freq](int a, int b) { return freq[a] > freq[b]; });
         return fast.empty() ? all : fast;
     }();
     return cores;
@@ -146,9 +148,15 @@ const std::vector<int> & fast_cores() {
 // well it fits this CPU (its ggml_backend_score() only checks the CPU features, it runs no vector code) and loads the
 // best, so a phone without dot-product gets the plain armv8.0 code instead of crashing with SIGILL. The libraries
 // are opened by file name: the app's linker namespace finds them inside the APK, extracted or not.
+// False only when the CPU backend is a separately loaded library and none of them loaded.
+bool g_cpu_backend_ready = true;
+
 void load_cpu_backend() {
 #ifdef GGML_BACKEND_DL
+    // Must list every android_* variant that ggml/src/CMakeLists.txt builds (LlamaJniVariantsTest checks it).
     static const char * const variants[] = {
+        "libggml-cpu-android_armv9.2_2.so",
+        "libggml-cpu-android_armv9.2_1.so",
         "libggml-cpu-android_armv9.0_1.so",
         "libggml-cpu-android_armv8.6_1.so",
         "libggml-cpu-android_armv8.2_2.so",
@@ -171,6 +179,7 @@ void load_cpu_backend() {
     if (best != nullptr && ggml_backend_load(best) != nullptr) {
         LOGI("cpu backend: %s", best);
     } else {
+        g_cpu_backend_ready = false;
         LOGI("no cpu backend could be loaded");
     }
 #endif
@@ -343,6 +352,12 @@ Java_com_thalzeronlabs_llama_NativeBridge_backendInit(JNIEnv *, jclass) {
 JNIEXPORT jlong JNICALL
 Java_com_thalzeronlabs_llama_NativeBridge_loadModel(JNIEnv * env, jclass, jstring jpath, jboolean use_mmap) {
     const std::string path = to_std_string(env, jpath);
+    if (!g_cpu_backend_ready) {
+        // Say so plainly: otherwise this surfaces as "could not load the model" and the user deletes a good file.
+        throw_java(env, "java/lang/UnsupportedOperationException",
+                   "No build of the inference engine supports this phone's CPU. The model file is fine.");
+        return 0;
+    }
     llama_model_params params = llama_model_default_params();
     params.n_gpu_layers = 0; // CPU only: predictable on every Android device.
     params.load_mode = use_mmap == JNI_TRUE ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE;

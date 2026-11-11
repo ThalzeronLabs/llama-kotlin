@@ -166,7 +166,16 @@ class LlamaSession internal constructor(
                     timeToFirstTokenMillis = firstToken?.let { it - started },
                     cachedPromptTokens = prompt.reusedTokens,
                     stopReason = reason ?: StopReason.CANCELLED,
-                )
+                ).also { s ->
+                    // One line per generation, so speed can be read from logcat without touching the UI.
+                    android.util.Log.i(
+                        "llama-kotlin",
+                        "generation: %d tokens in %d ms, %.1f tok/s; prompt %d tokens (%d cached) in %d ms; %s".format(
+                            java.util.Locale.ROOT, s.generatedTokens, s.generationMillis, s.tokensPerSecond,
+                            s.promptTokens, s.cachedPromptTokens, s.promptMillis, s.stopReason,
+                        ),
+                    )
+                }
             }
         }
     }.flowOn(dispatcher)
