@@ -5,12 +5,16 @@ project("llama-kotlin" LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Pick the right CPU code path per ABI: ARM gets the NEON/dotprod kernels, x86_64 (emulators) the generic one.
+# Pick the right CPU code path per ABI.
 if(ANDROID_ABI STREQUAL "arm64-v8a")
     set(GGML_SYSTEM_ARCH "ARM" CACHE STRING "" FORCE)
-    # Dot-product + fp16 instructions: present on virtually every arm64 phone since 2019 (Cortex-A55/A75 and newer)
-    # and several times faster for quantized matmuls than the generic armv8-a path.
-    set(GGML_CPU_ARM_ARCH "armv8.2-a+dotprod+fp16" CACHE STRING "" FORCE)
+    # One CPU backend per feature level (armv8.0, +dotprod, +fp16, +i8mm, +sve2), each a small shared library; at
+    # start-up the JNI side loads the best one the phone supports (see load_cpu_backend()). A single build for
+    # armv8.2+dotprod crashed with SIGILL on CPUs without dot-product (Cortex-A53/A73 phones, the ARM translation of
+    # x86 emulators). The variants need ggml as shared libraries.
+    set(GGML_BACKEND_DL ON CACHE BOOL "" FORCE)
+    set(GGML_CPU_ALL_VARIANTS ON CACHE BOOL "" FORCE)
+    set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
 elseif(ANDROID_ABI STREQUAL "x86_64")
     set(GGML_SYSTEM_ARCH "x86" CACHE STRING "" FORCE)
 endif()

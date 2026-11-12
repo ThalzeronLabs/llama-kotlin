@@ -6,6 +6,42 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-11
+
+### Changed
+
+- **Generation runs on the fast cores, on a persistent thread pool.** Each session keeps one ggml thread pool pinned
+  to the phone's fast cores (detected from each core's maximum frequency) instead of letting ggml create and destroy
+  its worker threads on every token, and its own thread runs at display priority. Android tends to put an app's
+  worker threads on the slow cluster: on a POCO X6 Pro (Dimensity 8300, Android 16) with Qwen2.5 0.5B Q4_K_M the
+  on-device chat app went from 8.7 to 23.1 tok/s with the pool alone (`llama-simple`: 7.7 tok/s on the four
+  Cortex-A510s, 40.7 on the A715s). If Android refuses the CPU mask (an app in the background), the threads run
+  unpinned.
+- **Default threads:** `threads = 0` now means one thread per fast core, at most 4 (it was cores − 2, at most 4).
+- **The armv8.6 CPU build is preferred over armv9.0.** On the POCO X6 Pro both decode at the same speed (45.6 and 45.1
+  tok/s, `llama-bench`), but the armv9.0 build (SVE) reads prompts about 11% slower (86 against 98 tok/s), so the loader
+  takes armv8.6 whenever the CPU can run both.
+
+### Added
+
+- **One log line per generation** (tag `llama-kotlin`, level INFO): tokens, time, tokens per second, prompt tokens (and
+  how many came from the cache) and why it stopped. Speed can be read from `adb logcat` without touching the UI.
+- **A clear error when no CPU build fits the phone.** `LlamaModel.load` throws `UnsupportedOperationException` ("No
+  build of the inference engine supports this phone's CPU. The model file is fine.") instead of failing later.
+
+### Fixed
+
+- **No more SIGILL on CPUs without dot-product.** The arm64 build was compiled for armv8.2-a+dotprod and crashed on
+  the first token on Cortex-A53/A73 phones and under the ARM translation of x86_64 emulators. It now ships ggml's
+  Android CPU variants (seven builds, from armv8.0 to armv9.2) and loads the best one the CPU supports at start-up. A unit
+  test checks that the list the loader knows matches the variants ggml builds.
+
+### Not done, on purpose
+
+- **i8mm alone does not speed up generation**, so it is not forced on: on the same phone, a build with
+  `+i8mm` decoded at 34 tok/s against 32 without it (`llama-simple`, 3 runs each), within noise, because decoding is
+  bound by memory bandwidth. The variant loader still picks the i8mm build on phones that have it.
+
 ## [0.2.2] - 2026-11-02
 
 ### Fixed
@@ -89,7 +125,8 @@ First public release.
 - Contributor guide, code of conduct, issue and pull request templates.
 - `kotlinx-coroutines-core` is exposed as an `api` dependency, because `Flow` is part of the public API.
 
-[Unreleased]: https://github.com/ThalzeronLabs/llama-kotlin/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/ThalzeronLabs/llama-kotlin/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ThalzeronLabs/llama-kotlin/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/ThalzeronLabs/llama-kotlin/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/ThalzeronLabs/llama-kotlin/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ThalzeronLabs/llama-kotlin/compare/v0.1.1...v0.2.0

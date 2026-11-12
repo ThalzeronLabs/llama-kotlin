@@ -166,7 +166,16 @@ class LlamaSession internal constructor(
                     timeToFirstTokenMillis = firstToken?.let { it - started },
                     cachedPromptTokens = prompt.reusedTokens,
                     stopReason = reason ?: StopReason.CANCELLED,
-                )
+                ).also { s ->
+                    // One line per generation, so speed can be read from logcat without touching the UI.
+                    android.util.Log.i(
+                        "llama-kotlin",
+                        "generation: %d tokens in %d ms, %.1f tok/s; prompt %d tokens (%d cached) in %d ms; %s".format(
+                            java.util.Locale.ROOT, s.generatedTokens, s.generationMillis, s.tokensPerSecond,
+                            s.promptTokens, s.cachedPromptTokens, s.promptMillis, s.stopReason,
+                        ),
+                    )
+                }
             }
         }
     }.flowOn(dispatcher)
@@ -227,8 +236,17 @@ class LlamaSession internal constructor(
     }
 
     internal companion object {
+        /**
+         * The session's own thread. It computes a share of every token next to the native worker threads, which wait
+         * for it at each step, so it runs at display priority: at the default priority it loses the fast cores to
+         * the UI and slows the whole step down. On a desktop JVM (host tests) the priority call is skipped.
+         */
         fun newSessionDispatcher(): ExecutorCoroutineDispatcher =
-            Executors.newSingleThreadExecutor { r -> Thread(r, "llama-session").apply { isDaemon = true } }
-                .asCoroutineDispatcher()
+            Executors.newSingleThreadExecutor { r ->
+                Thread({
+                    runCatching { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY) }
+                    r.run()
+                }, "llama-session").apply { isDaemon = true }
+            }.asCoroutineDispatcher()
     }
 }

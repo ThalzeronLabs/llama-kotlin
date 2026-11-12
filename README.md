@@ -28,7 +28,7 @@ dependencyResolutionManagement {
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.ThalzeronLabs:llama-kotlin:v0.2.2")
+    implementation("com.github.ThalzeronLabs:llama-kotlin:v0.3.0")
 }
 ```
 
@@ -56,7 +56,7 @@ Every [GitHub release](https://github.com/ThalzeronLabs/llama-kotlin/releases) h
 
 ```kotlin
 dependencies {
-    implementation(files("libs/llama-kotlin-0.2.2.aar"))
+    implementation(files("libs/llama-kotlin-0.3.0.aar"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2") // not pulled in by a plain AAR
 }
 ```
@@ -264,7 +264,7 @@ thread count and thermal status — ready to paste into an issue.
 
 | Model | File | Size | Android phone (arm64) | Linux x86_64 host check* |
 |---|---|---|---|---|
-| [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF) | `qwen2.5-0.5b-instruct-q4_k_m.gguf` (Q4_K_M) | 491 MB | tokens/s **to be measured** | ✅ loads, chats, streams; 39–42 tokens/s (measured with v0.1.1) |
+| [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF) | `qwen2.5-0.5b-instruct-q4_k_m.gguf` (Q4_K_M) | 491 MB | POCO X6 Pro: see [Speed on a real phone](#speed-on-a-real-phone) | ✅ loads, chats, streams; 39–42 tokens/s on the host, not a phone (v0.1.1) |
 
 \* The host check runs this library's real Kotlin API and JNI code, compiled for Linux instead of Android, on a
 4-thread Intel Xeon @ 2.1 GHz (greedy, 128 generated tokens, 4 runs). Its output matched llama.cpp's own
@@ -274,6 +274,26 @@ The host integration tests in CI also run two tiny models on Linux on every push
 [`stories15M-q4_0`](https://huggingface.co/ggml-org/models/tree/main/tinyllamas) (generation, grammars, saved state)
 and [`bge-small` f16](https://huggingface.co/ggml-org/models/tree/main/bert-bge-small) (embeddings). Those checks
 are about correctness only; no speed is recorded.
+
+### Speed on a real phone
+
+POCO X6 Pro (MediaTek Dimensity 8300: 1× Cortex-A715 @ 3.35 GHz, 3× A715 @ 3.2 GHz, 4× A510 @ 2.2 GHz; Android 16),
+Qwen2.5-0.5B-Instruct Q4_K_M, 4 threads, generation (decode) speed:
+
+| Where the work runs | tokens/s |
+|---|---|
+| The four slow cores (A510), where Android tended to put the app's threads | 7.7 |
+| Before this release, inside the [on-device chat app](https://github.com/ThalzeronLabs/android-on-device-llm) | 7.4–8.8 |
+| The fast cores, worker threads recreated on every token (`llama-simple`) | 40.7 |
+| The fast cores, persistent pinned thread pool (`llama-bench --cpu-mask 0xf0 --cpu-strict 1`) | 49.7 |
+| With this release, inside the same app: one long answer | 33.3 |
+| With this release, inside the same app: back-to-back answers for 5 minutes (CPU 51–71 °C, no throttling) | 31.8 → 22.3, median 27.4 |
+| With this release, the app in the background (Android keeps background apps on the slow cores) | 5.3 |
+
+The lesson: on a big.LITTLE phone the speed depends more on *which* cores run the model than on the CPU kernels.
+`+i8mm` kernels did not change decode speed (34 vs 32 tok/s): decoding a small model is bound by memory bandwidth.
+The same goes for SVE: the armv9 build matched the armv8.6 build on decode (45.1 vs 45.6 tok/s) and was about 11%
+slower on the prompt. The app still trails the bare `llama-bench` number by about a third; profiling that gap is next.
 
 Any GGUF chat model that the pinned llama.cpp supports should work. Bigger models that are worth a try on
 phones with more RAM: Qwen2.5-1.5B-Instruct, Llama-3.2-3B-Instruct (Q4_K_M). Ran one on your phone?
@@ -308,6 +328,9 @@ Kotlin  LlamaModel / LlamaSession  ──Flow<String>──▶ your UI
 JNI     llama_jni.cpp   (opaque handles, Java exceptions on failure)
           ▼
 C++     llama.cpp (pinned as a git submodule)  →  ggml CPU kernels (NEON on ARM)
+          │  arm64: the best of ggml's Android CPU variants for this phone, loaded at start-up
+          ▼
+CPU     one persistent thread pool per session, pinned to the fast cores
 ```
 
 The session ingests the prompt in batches (reusing the longest prefix already in the KV cache), then loops:

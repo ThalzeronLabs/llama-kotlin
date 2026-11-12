@@ -9,7 +9,7 @@ data class ModelParams(
      * The embedding context is created on the first [LlamaModel.embed] call, not at load time.
      */
     val embeddingContextSize: Int = 512,
-    /** CPU threads for [LlamaModel.embed]; 0 picks a safe default for the device (cores - 2, at most 4). */
+    /** CPU threads for [LlamaModel.embed]; 0 picks one per fast core (the big cores of a big.LITTLE phone), at most 4. */
     val embeddingThreads: Int = 0,
 ) {
     init {
@@ -29,7 +29,7 @@ data class SessionParams(
     val contextSize: Int = 2048,
     /** How many prompt tokens are processed per step. */
     val batchSize: Int = 512,
-    /** CPU threads; 0 picks a safe default for the device (cores - 2, at most 4). */
+    /** CPU threads; 0 picks one per fast core (the big cores of a big.LITTLE phone), at most 4. */
     val threads: Int = 0,
     /**
      * 0 means greedy (always the most likely token); higher is more creative. A single call can override it with

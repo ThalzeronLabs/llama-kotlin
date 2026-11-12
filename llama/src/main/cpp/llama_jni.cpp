@@ -7,16 +7,21 @@
 // The file also builds on a desktop JVM (Linux/macOS) so the host integration tests can run it against a real
 // model; only logging differs.
 
+#include <dlfcn.h>
 #include <jni.h>
 
 #include <algorithm>
+#include <cstring>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "llama.h"
 
 #define LOG_TAG "llama-kotlin"
@@ -41,6 +46,7 @@ struct SamplingConfig {
 
 struct Session {
     llama_context *     ctx     = nullptr;
+    ggml_threadpool *   pool    = nullptr; // persistent worker threads on the fast cores (see make_pool())
     llama_sampler *     chain   = nullptr; // everything but the grammar
     llama_sampler *     grammar = nullptr; // optional, applied lazily (see sample())
     llama_batch_ext *   batch   = nullptr;
@@ -112,10 +118,121 @@ jstring utf8_to_jstring(JNIEnv * env, const std::string & text) {
     return result;
 }
 
+// The cores worth computing on. Phones mix a slow cluster with fast ones, and Android tends to run an app's worker
+// threads on the slow one: on a Dimensity 8300 the same model decodes at 7.7 tok/s on the four Cortex-A510s and at
+// 40+ on the Cortex-A715s. Returns the cores whose maximum frequency is above the slowest cluster's, or every core
+// when they are all alike or the frequencies cannot be read (desktop, emulator).
+const std::vector<int> & fast_cores() {
+    static const std::vector<int> cores = [] {
+        const int n = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+        std::vector<long> freq(n, 0);
+        for (int i = 0; i < n; ++i) {
+            std::ifstream in("/sys/devices/system/cpu/cpu" + std::to_string(i) + "/cpufreq/cpuinfo_max_freq");
+            if (!(in >> freq[i])) freq[i] = 0;
+        }
+        std::vector<int> all(n);
+        for (int i = 0; i < n; ++i) all[i] = i;
+        if (std::any_of(freq.begin(), freq.end(), [](long f) { return f <= 0; })) return all;
+        const long slowest = *std::min_element(freq.begin(), freq.end());
+        std::vector<int> fast;
+        for (int i = 0; i < n; ++i) {
+            if (freq[i] > slowest) fast.push_back(i);
+        }
+        // Fastest first, so a pool smaller than the fast cluster still gets the prime core.
+        std::stable_sort(fast.begin(), fast.end(), [&freq](int a, int b) { return freq[a] > freq[b]; });
+        return fast.empty() ? all : fast;
+    }();
+    return cores;
+}
+
+// On arm64 Android the CPU backend comes as one library per feature level (see CMakeLists.txt). Asks each one how
+// well it fits this CPU (its ggml_backend_score() only checks the CPU features, it runs no vector code) and loads the
+// best, so a phone without dot-product gets the plain armv8.0 code instead of crashing with SIGILL. The libraries
+// are opened by file name: the app's linker namespace finds them inside the APK, extracted or not.
+// False only when the CPU backend is a separately loaded library and none of them loaded.
+bool g_cpu_backend_ready = true;
+
+void load_cpu_backend() {
+#ifdef GGML_BACKEND_DL
+    // Must list every android_* variant that ggml/src/CMakeLists.txt builds (CpuVariantsTest checks it).
+    static const char * const variants[] = {
+        "libggml-cpu-android_armv9.2_2.so",
+        "libggml-cpu-android_armv9.2_1.so",
+        "libggml-cpu-android_armv9.0_1.so",
+        "libggml-cpu-android_armv8.6_1.so",
+        "libggml-cpu-android_armv8.2_2.so",
+        "libggml-cpu-android_armv8.2_1.so",
+        "libggml-cpu-android_armv8.0_1.so",
+    };
+    // armv9.0 only adds SVE2 over armv8.6, and phone SVE is 128 bits wide: on a POCO X6 Pro (Cortex-A715) the
+    // armv9.0 build decoded at the same speed (45.1 vs 45.6 tok/s) and read prompts about 11% slower (86 vs 98 tok/s).
+    // So when both fit, armv8.6 is used. The armv9.2 builds add SME (a matrix unit) and are still preferred.
+    static const char * const armv9_0 = "libggml-cpu-android_armv9.0_1.so";
+    static const char * const armv8_6 = "libggml-cpu-android_armv8.6_1.so";
+    const char * best = nullptr;
+    int best_score = 0;
+    bool armv8_6_fits = false;
+    for (const char * name : variants) {
+        void * handle = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+        if (handle == nullptr) continue;
+        auto * score = reinterpret_cast<int (*)()>(dlsym(handle, "ggml_backend_score"));
+        const int s = score != nullptr ? score() : 0;
+        dlclose(handle);
+        if (std::strcmp(name, armv8_6) == 0 && s > 0) armv8_6_fits = true;
+        if (s > best_score) {
+            best_score = s;
+            best = name;
+        }
+    }
+    if (best != nullptr && std::strcmp(best, armv9_0) == 0 && armv8_6_fits) best = armv8_6;
+    if (best != nullptr && ggml_backend_load(best) != nullptr) {
+        LOGI("cpu backend: %s", best);
+    } else {
+        g_cpu_backend_ready = false;
+        LOGI("no cpu backend could be loaded");
+    }
+#endif
+}
+
+// Default: one thread per fast core, at most 4 (past that, decoding is limited by memory bandwidth, not cores).
 int resolve_threads(jint n_threads) {
-    return n_threads > 0
-            ? n_threads
-            : std::max(1, std::min(4, static_cast<int>(std::thread::hardware_concurrency()) - 2));
+    return n_threads > 0 ? n_threads : std::max(1, std::min(4, static_cast<int>(fast_cores().size())));
+}
+
+// A persistent thread pool pinned to the fast cores. Without one, ggml creates and destroys its worker threads on
+// every token and the scheduler is free to put them on the slow cores (measured: 32 -> 50 tok/s with the pool).
+// The pool starts paused so ggml pins the thread that computes (the session's own thread, which also does a share
+// of the work) on the first decode, rather than the thread that happens to create the session. The functions come
+// from the CPU backend's registry so this keeps working when the backend is a separately loaded library.
+ggml_threadpool * make_pool(int threads) {
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (dev == nullptr) return nullptr;
+    auto * pool_new = reinterpret_cast<decltype(ggml_threadpool_new) *>(
+            ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_threadpool_new"));
+    if (pool_new == nullptr) return nullptr;
+
+    ggml_threadpool_params params = ggml_threadpool_params_default(threads);
+    params.paused = true;
+    const auto & cores = fast_cores();
+    // Pin only when every thread gets a fast core of its own; asked for more threads than that, let the scheduler
+    // spread them. If Android refuses the mask (the app in the background is limited to the slow cores), ggml
+    // logs it and the threads simply run unpinned.
+    if (threads <= static_cast<int>(cores.size()) &&
+        cores.size() < static_cast<size_t>(std::thread::hardware_concurrency())) {
+        for (int core : cores) {
+            if (core < GGML_MAX_N_THREADS) params.cpumask[core] = true;
+        }
+        params.strict_cpu = true;
+    }
+    return pool_new(&params);
+}
+
+void free_pool(ggml_threadpool * pool) {
+    if (pool == nullptr) return;
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    auto * pool_free = reinterpret_cast<decltype(ggml_threadpool_free) *>(
+            ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_threadpool_free"));
+    if (pool_free != nullptr) pool_free(pool);
 }
 
 std::vector<llama_token> tokenize(const llama_vocab * vocab, const std::string & text, bool add_special) {
@@ -235,12 +352,21 @@ extern "C" {
 
 JNIEXPORT void JNICALL
 Java_com_thalzeronlabs_llama_NativeBridge_backendInit(JNIEnv *, jclass) {
-    std::call_once(g_backend_once, [] { llama_backend_init(); });
+    std::call_once(g_backend_once, [] {
+        load_cpu_backend();
+        llama_backend_init();
+    });
 }
 
 JNIEXPORT jlong JNICALL
 Java_com_thalzeronlabs_llama_NativeBridge_loadModel(JNIEnv * env, jclass, jstring jpath, jboolean use_mmap) {
     const std::string path = to_std_string(env, jpath);
+    if (!g_cpu_backend_ready) {
+        // Say so plainly: otherwise this surfaces as "could not load the model" and the user deletes a good file.
+        throw_java(env, "java/lang/UnsupportedOperationException",
+                   "No build of the inference engine supports this phone's CPU. The model file is fine.");
+        return 0;
+    }
     llama_model_params params = llama_model_default_params();
     params.n_gpu_layers = 0; // CPU only: predictable on every Android device.
     params.load_mode = use_mmap == JNI_TRUE ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE;
@@ -340,6 +466,8 @@ Java_com_thalzeronlabs_llama_NativeBridge_newSession(
 
     auto * s = new Session();
     s->ctx = ctx;
+    s->pool = make_pool(threads);
+    if (s->pool != nullptr) llama_attach_threadpool(ctx, s->pool, nullptr);
     s->batch = llama_batch_ext_init(ctx);
     s->vocab = llama_model_get_vocab(model);
     s->n_batch = n_batch;
@@ -349,7 +477,8 @@ Java_com_thalzeronlabs_llama_NativeBridge_newSession(
     s->sampling.min_p = min_p;
     s->sampling.seed = static_cast<uint32_t>(seed);
     s->chain = build_chain(s->sampling);
-    LOGI("session ready: n_ctx=%d n_batch=%d threads=%d", n_ctx, n_batch, threads);
+    LOGI("session ready: n_ctx=%d n_batch=%d threads=%d fast_cores=%zu pool=%s", n_ctx, n_batch, threads,
+         fast_cores().size(), s->pool != nullptr ? "pinned" : "none");
     return reinterpret_cast<jlong>(s);
 }
 
@@ -360,6 +489,7 @@ Java_com_thalzeronlabs_llama_NativeBridge_freeSession(JNIEnv *, jclass, jlong ha
     free_samplers(s);
     llama_batch_ext_free(s->batch);
     llama_free(s->ctx);
+    free_pool(s->pool); // after the context, which uses it
     delete s;
 }
 
