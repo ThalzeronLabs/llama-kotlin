@@ -121,3 +121,29 @@ afterEvaluate {
         }
     }
 }
+
+// The licenses of everything bundled in this build travel INSIDE it, so a copy passed around on its own still carries
+// them. In the AAR the file has its own path, assets/llama-kotlin/THIRD-PARTY-NOTICES.txt: Android merges the assets of
+// an app and its libraries, and on a name clash the app's file wins, which would silently drop the llama.cpp notice.
+abstract class CopyThirdPartyNotices : DefaultTask() {
+    @get:InputFile
+    abstract val notices: RegularFileProperty
+
+    @get:OutputDirectory
+    abstract val outputDir: DirectoryProperty
+
+    @TaskAction
+    fun copy() {
+        notices.get().asFile.copyTo(outputDir.get().file("llama-kotlin/THIRD-PARTY-NOTICES.txt").asFile, overwrite = true)
+    }
+}
+
+val copyThirdPartyNotices = tasks.register<CopyThirdPartyNotices>("copyThirdPartyNotices") {
+    notices.set(layout.projectDirectory.file("../THIRD-PARTY-NOTICES.txt"))
+}
+
+androidComponents {
+    onVariants { variant ->
+        variant.sources.assets?.addGeneratedSourceDirectory(copyThirdPartyNotices, CopyThirdPartyNotices::outputDir)
+    }
+}

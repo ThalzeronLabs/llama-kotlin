@@ -58,3 +58,28 @@ dependencies {
 
     testImplementation(libs.junit)
 }
+
+// The licenses of everything bundled in this build travel INSIDE it, as assets/THIRD-PARTY-NOTICES.txt, so a copy
+// passed around on its own still carries them. The file lives at the repository root, next to the LICENSE.
+abstract class CopyThirdPartyNotices : DefaultTask() {
+    @get:InputFile
+    abstract val notices: RegularFileProperty
+
+    @get:OutputDirectory
+    abstract val outputDir: DirectoryProperty
+
+    @TaskAction
+    fun copy() {
+        notices.get().asFile.copyTo(outputDir.get().file("THIRD-PARTY-NOTICES.txt").asFile, overwrite = true)
+    }
+}
+
+val copyThirdPartyNotices = tasks.register<CopyThirdPartyNotices>("copyThirdPartyNotices") {
+    notices.set(layout.projectDirectory.file("../THIRD-PARTY-NOTICES.txt"))
+}
+
+androidComponents {
+    onVariants { variant ->
+        variant.sources.assets?.addGeneratedSourceDirectory(copyThirdPartyNotices, CopyThirdPartyNotices::outputDir)
+    }
+}
