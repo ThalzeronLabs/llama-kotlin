@@ -37,10 +37,11 @@ jobs:
 
       - name: The third-party notices are inside the build
         run: |
-          for f in llama/build/outputs/aar/llama-release.aar benchmark/build/outputs/apk/release/benchmark-release.apk; do
-            unzip -l "$f" | grep -q "assets/THIRD-PARTY-NOTICES.txt" || { echo "::error::$f has no assets/THIRD-PARTY-NOTICES.txt"; exit 1; }
-            echo "ok: $f"
-          done
+          # the AAR keeps its own path, so an app's notices file never replaces it when the assets are merged
+          check() { unzip -l "$1" | grep -q "$2" || { echo "::error::$1 has no $2"; exit 1; }; echo "ok: $1 $2"; }
+          check llama/build/outputs/aar/llama-release.aar assets/llama-kotlin/THIRD-PARTY-NOTICES.txt
+          check benchmark/build/outputs/apk/release/benchmark-release.apk assets/THIRD-PARTY-NOTICES.txt
+          check benchmark/build/outputs/apk/release/benchmark-release.apk assets/llama-kotlin/THIRD-PARTY-NOTICES.txt
 
       - name: Publishing and API docs still build
         run: ./gradlew :llama:publishToMavenLocal :llama:dokkaGenerate -x test
