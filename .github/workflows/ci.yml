@@ -35,6 +35,13 @@ jobs:
       - name: Build the AAR (arm64-v8a + x86_64) and the benchmark APK
         run: ./gradlew :llama:assembleRelease :benchmark:assembleRelease
 
+      - name: The third-party notices are inside the build
+        run: |
+          for f in llama/build/outputs/aar/llama-release.aar benchmark/build/outputs/apk/release/benchmark-release.apk; do
+            unzip -l "$f" | grep -q "assets/THIRD-PARTY-NOTICES.txt" || { echo "::error::$f has no assets/THIRD-PARTY-NOTICES.txt"; exit 1; }
+            echo "ok: $f"
+          done
+
       - name: Publishing and API docs still build
         run: ./gradlew :llama:publishToMavenLocal :llama:dokkaGenerate -x test
 
