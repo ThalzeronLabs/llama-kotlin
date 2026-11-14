@@ -98,7 +98,7 @@ jobs:
             gh release create "$TAG" --title "$TAG" --notes-file notes.md --target "$GITHUB_SHA"
           fi
           gh release upload "$TAG" "llama-kotlin-$VERSION.aar" "llama-kotlin-$VERSION.aar.sha256" \
-            "llama-kotlin-benchmark-$VERSION.apk" --clobber
+            "llama-kotlin-benchmark-$VERSION.apk" THIRD-PARTY-NOTICES.txt --clobber
 
       - name: Ask JitPack to build the tag
         continue-on-error: true

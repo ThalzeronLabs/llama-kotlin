@@ -365,3 +365,5 @@ list and read [CONTRIBUTING.md](CONTRIBUTING.md). Changes are tracked in [CHANGE
 ## License
 
 Apache-2.0 © Esdras Souza (Thalzeron Labs). llama.cpp is MIT-licensed by its authors (see [`NOTICE`](NOTICE)).
+
+The release builds bundle third-party code; their licenses and notices are in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt), which is also attached to every release.
