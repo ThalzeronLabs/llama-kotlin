@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Documentation
+
+- Add the Awesome Kotlin listing and the LLM Repos catalog entry to the README.
+
 ## [0.3.0] - 2026-11-11
 
 ### Changed
